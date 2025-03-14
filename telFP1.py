@@ -244,7 +244,7 @@ def laps_data(
 
     driver_laps = laps.pick_drivers(driver)
     # Remove rows where LapTime is null
-    driver_laps = driver_laps.dropna(subset=["LapTime"]).reset_index(drop=True).copy()
+    # driver_laps = driver_laps.dropna(subset=["LapTime"]).reset_index(drop=True).copy()
     driver_laps["LapTime"] = pd.to_numeric(
         driver_laps["LapTime"].apply(
             lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
@@ -464,11 +464,11 @@ def process_telemetry_data():
 
                 for driver in drivers:
                     driver_laps = laps.pick_drivers(driver)
-                    driver_laps = (
-                        driver_laps.dropna(subset=["LapTime"])
-                        .reset_index(drop=True)
-                        .copy()
-                    )
+                    # driver_laps = (
+                    #     driver_laps.dropna(subset=["LapTime"])
+                    #     .reset_index(drop=True)
+                    #     .copy()
+                    # )
 
                     # Vectorized operations
                     driver_laps["LapTime"] = pd.to_numeric(
