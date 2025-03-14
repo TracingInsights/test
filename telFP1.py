@@ -1,30 +1,21 @@
-import concurrent.futures
-import gc
+import json
 import logging
 import os
 import time
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Union
 
 import fastf1
 import numpy as np
-import orjson as json_lib
 import pandas as pd
 import requests
 
 import utils
-
-pd.options.mode.chained_assignment = None
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-logging.getLogger("fastf1").setLevel(logging.WARNING)
-# Prevent propagation to avoid duplicate logs
-logging.getLogger("fastf1").propagate = False
 
 fastf1.Cache.enable_cache("cache")
 YEAR = 2025
@@ -204,7 +195,6 @@ def get_sessions(year: int, event: str) -> List[str]:
         return normal_sessions
 
 
-@lru_cache(maxsize=128)
 def get_session(year: int, event: str, session: str) -> fastf1.core.Session:
     """Get F1 session with proper handling for testing sessions."""
     if event == "Pre-Season Testing":
@@ -452,10 +442,10 @@ def get_circuit_info(year: int, circuit_key: int) -> Optional[pd.DataFrame]:
 
 
 def save_json(data: Any, file_path: str) -> None:
-    """Save data to a JSON file using orjson for better performance."""
+    """Save data to a JSON file, creating directories if needed."""
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    with open(file_path, "wb") as json_file:
-        json_file.write(json_lib.dumps(data, option=json_lib.OPT_SERIALIZE_NUMPY))
+    with open(file_path, "w") as json_file:
+        json.dump(data, json_file)
     logger.debug(f"Data saved to {file_path}")
 
 
@@ -471,79 +461,46 @@ def process_telemetry_data():
                 f1session = get_session(YEAR, event, session)
                 f1session.load(telemetry=False, weather=False, messages=False)
                 laps = f1session.laps
-                # Optimize worker count based on GitHub Actions environment
-                # GitHub-hosted runners typically have 2 cores
-                max_workers = min(4, os.cpu_count() or 2)
-                # Process drivers in parallel
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max_workers
-                ) as executor:
-                    futures = []
-                    for driver in drivers:
-                        futures.append(
-                            executor.submit(
-                                process_driver_telemetry,
-                                YEAR,
-                                event,
-                                session,
-                                driver,
-                                laps,
+
+                for driver in drivers:
+                    driver_laps = laps.pick_drivers(driver)
+                    driver_laps = (
+                        driver_laps.dropna(subset=["LapTime"])
+                        .reset_index(drop=True)
+                        .copy()
+                    )
+
+                    # Vectorized operations
+                    driver_laps["LapTime"] = pd.to_numeric(
+                        driver_laps["LapTime"].apply(
+                            lambda x: (
+                                x.total_seconds() if hasattr(x, "total_seconds") else x
                             )
                         )
+                    )
+                    driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
+                    driver_lap_numbers = driver_laps["LapNumber"].tolist()
 
-                    # Wait for all futures to complete
-                    for future in concurrent.futures.as_completed(futures):
+                    # Create folder once per driver
+                    driver_folder = f"{event}/{session}/{driver}"
+                    os.makedirs(driver_folder, exist_ok=True)
+
+                    for lap_number in driver_lap_numbers:
                         try:
-                            future.result()
+                            telemetry = telemetry_data(
+                                YEAR, event, session, driver, lap_number
+                            )
+                            if telemetry:
+                                file_path = f"{driver_folder}/{lap_number}_tel.json"
+                                save_json(telemetry, file_path)
                         except Exception as e:
-                            logger.error(f"Error in parallel processing: {e}")
-
+                            logger.warning(
+                                f"Error processing telemetry for {driver} lap {lap_number}: {e}"
+                            )
+                            continue
             except Exception as e:
                 logger.error(f"Error processing {event} - {session}: {e}")
                 continue
-
-
-def process_driver_telemetry(year, event, session, driver, laps):
-    """Process telemetry data for a specific driver."""
-    try:
-        driver_laps = laps.pick_drivers(driver)
-        driver_laps = (
-            driver_laps.dropna(subset=["LapTime"]).reset_index(drop=True).copy()
-        )
-
-        # Vectorized operations
-        driver_laps["LapTime"] = pd.to_numeric(
-            driver_laps["LapTime"].apply(
-                lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
-            )
-        )
-        driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
-        driver_lap_numbers = driver_laps["LapNumber"].tolist()
-
-        # Create folder once per driver
-        driver_folder = f"{event}/{session}/{driver}"
-        os.makedirs(driver_folder, exist_ok=True)
-
-        # Process in smaller batches to reduce memory usage
-        batch_size = 5
-        for i in range(0, len(driver_lap_numbers), batch_size):
-            batch_laps = driver_lap_numbers[i : i + batch_size]
-            for lap_number in batch_laps:
-                try:
-                    telemetry = telemetry_data(year, event, session, driver, lap_number)
-                    if telemetry:
-                        file_path = f"{driver_folder}/{lap_number}_tel.json"
-                        save_json(telemetry, file_path)
-                        # Force garbage collection after each lap
-                        if i % batch_size == batch_size - 1:
-                            gc.collect()
-                except Exception as e:
-                    logger.warning(
-                        f"Error processing telemetry for {driver} lap {lap_number}: {e}"
-                    )
-                    continue
-    except Exception as e:
-        logger.error(f"Error processing driver {driver}: {e}")
 
 
 def save_drivers_data():
@@ -561,19 +518,6 @@ def save_drivers_data():
                 logger.error(f"Error saving driver data for {event} - {session}: {e}")
 
 
-def process_driver_laptimes(year, event, session, driver):
-    """Process and save lap times for a specific driver."""
-    try:
-        driver_folder = f"{event}/{session}/{driver}"
-        os.makedirs(driver_folder, exist_ok=True)
-
-        laptimes = laps_data(year, event, session, driver)
-        file_path = f"{driver_folder}/laptimes.json"
-        save_json(laptimes, file_path)
-    except Exception as e:
-        logger.error(f"Error processing lap times for driver {driver}: {e}")
-
-
 def save_lap_times():
     """Save lap times for each driver in each event and session."""
     for event in events:
@@ -582,36 +526,13 @@ def save_lap_times():
                 logger.info(f"Saving lap times for {event} - {session}")
                 drivers = session_drivers_list(YEAR, event, session)
 
-                # Process in batches of 5 drivers
-                batch_size = 5
-                for i in range(0, len(drivers), batch_size):
-                    batch_drivers = drivers[i : i + batch_size]
+                for driver in drivers:
+                    driver_folder = f"{event}/{session}/{driver}"
+                    os.makedirs(driver_folder, exist_ok=True)
 
-                    # Process batch in parallel
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=batch_size
-                    ) as executor:
-                        futures = []
-                        for driver in batch_drivers:
-                            futures.append(
-                                executor.submit(
-                                    process_driver_laptimes,
-                                    YEAR,
-                                    event,
-                                    session,
-                                    driver,
-                                )
-                            )
-
-                        # Wait for all futures to complete
-                        for future in concurrent.futures.as_completed(futures):
-                            try:
-                                future.result()
-                            except Exception as e:
-                                logger.error(
-                                    f"Error in parallel lap time processing: {e}"
-                                )
-
+                    laptimes = laps_data(YEAR, event, session, driver)
+                    file_path = f"{driver_folder}/laptimes.json"
+                    save_json(laptimes, file_path)
             except Exception as e:
                 logger.error(f"Error saving lap times for {event} - {session}: {e}")
 
@@ -676,19 +597,10 @@ def main():
     try:
         logger.info(f"Starting data collection for year {YEAR}")
 
-        # Clear memory before starting
-        gc.collect()
-
         # Process all data types
         process_telemetry_data()
-        gc.collect()  # Force garbage collection between major operations
-
         save_drivers_data()
-        gc.collect()
-
         save_lap_times()
-        gc.collect()
-
         save_circuit_data()
 
         logger.info("Data collection completed successfully")
@@ -697,15 +609,11 @@ def main():
         # Wait and retry once
         logger.info("Waiting 5 seconds before retrying...")
         time.sleep(5)
-        gc.collect()  # Clear memory before retry
         try:
             logger.info("Retrying data collection...")
             process_telemetry_data()
-            gc.collect()
             save_drivers_data()
-            gc.collect()
             save_lap_times()
-            gc.collect()
             save_circuit_data()
             logger.info("Retry completed successfully")
         except Exception as e2:
@@ -713,45 +621,23 @@ def main():
 
 
 if __name__ == "__main__":
-    # Check if running in GitHub Actions
-    is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-
-    # Configure logging based on environment
-    if is_github_actions:
-        # Simpler logging for CI environment
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[logging.StreamHandler()],
-        )
-    else:
-        # Full logging for local environment
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.FileHandler("f1_data_collection.log"),
-                logging.StreamHandler(),
-            ],
-        )
-
-    # Configure cache location based on environment
-    if is_github_actions:
-        # Use a directory that persists in GitHub Actions cache
-        cache_dir = os.environ.get("GITHUB_WORKSPACE", "") + "/fastf1_cache"
-        os.makedirs(cache_dir, exist_ok=True)
-        fastf1.Cache.enable_cache(cache_dir)
-
-    else:
-        fastf1.Cache.enable_cache("cache")
-
-    # Import any missing modules
+    # Import any missing modules needed for the circuit info API
     try:
         import requests
     except ImportError:
         logger.error(
             "Missing required module: requests. Please install with 'pip install requests'"
         )
+
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler("f1_data_collection.log"),
+            logging.StreamHandler(),
+        ],
+    )
 
     # Run the main function
     main()
