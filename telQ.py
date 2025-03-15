@@ -504,7 +504,6 @@ def check_memory_usage(threshold_percent=80):
             f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
         )
         # Clear the session cache
-        from telQ_optimized import CIRCUIT_INFO_CACHE, SESSION_CACHE
 
         SESSION_CACHE.clear()
         CIRCUIT_INFO_CACHE.clear()
