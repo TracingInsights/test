@@ -103,7 +103,7 @@ class TelemetryExtractor:
                 f1session = self.get_session(event, session)
 
             laps = f1session.laps
-            driver_laps = laps.pick_drivers(driver)
+            driver_laps = laps.pick_drivers(driver).copy()  # Create a copy here
             driver_laps["LapTime"] = driver_laps["LapTime"].apply(
                 lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
             )
@@ -374,7 +374,7 @@ class TelemetryExtractor:
 
             # Get driver laps
             laps = f1session.laps
-            driver_laps = laps.pick_drivers(driver)
+            driver_laps = laps.pick_drivers(driver).copy()  # Create a copy here
             driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
             driver_laps["LapTime"] = driver_laps["LapTime"].apply(
                 lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
