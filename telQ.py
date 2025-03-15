@@ -328,8 +328,7 @@ class TelemetryExtractor:
             )
             return {"tel": {}}
 
-
-        def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
+    def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
         """
         Get circuit corner information.
 
@@ -343,17 +342,17 @@ class TelemetryExtractor:
         try:
             f1session = fastf1.get_session(self.year, event, session)
             f1session.load()
-            circuit_key = f1session.session_info['Meeting']['Circuit']['Key']
+            circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             # Try to get corner data from fastf1 first
             try:
                 circuit_info = f1session.get_circuit_info().corners
                 corner_info = {
-                    "CornerNumber": circuit_info['Number'].tolist(),
-                    "X": circuit_info['X'].tolist(),
-                    "Y": circuit_info['Y'].tolist(),
-                    "Angle": circuit_info['Angle'].tolist(),
-                    "Distance": circuit_info['Distance'].tolist(),
+                    "CornerNumber": circuit_info["Number"].tolist(),
+                    "X": circuit_info["X"].tolist(),
+                    "Y": circuit_info["Y"].tolist(),
+                    "Angle": circuit_info["Angle"].tolist(),
+                    "Distance": circuit_info["Distance"].tolist(),
                 }
                 return corner_info
             except (AttributeError, KeyError):
@@ -361,11 +360,11 @@ class TelemetryExtractor:
                 circuit_info = self._get_circuit_info_from_api(circuit_key)
                 if circuit_info is not None:
                     corner_info = {
-                        "CornerNumber": circuit_info['Number'].tolist(),
-                        "X": circuit_info['X'].tolist(),
-                        "Y": circuit_info['Y'].tolist(),
-                        "Angle": circuit_info['Angle'].tolist(),
-                        "Distance": (circuit_info['Distance']/10).tolist(),
+                        "CornerNumber": circuit_info["Number"].tolist(),
+                        "X": circuit_info["X"].tolist(),
+                        "Y": circuit_info["Y"].tolist(),
+                        "Angle": circuit_info["Angle"].tolist(),
+                        "Distance": (circuit_info["Distance"] / 10).tolist(),
                     }
                     return corner_info
 
@@ -394,19 +393,20 @@ class TelemetryExtractor:
 
             data = response.json()
             rows = []
-            for entry in data['corners']:
-                rows.append((
-                    float(entry.get('trackPosition', {}).get('x', 0.0)),
-                    float(entry.get('trackPosition', {}).get('y', 0.0)),
-                    int(entry.get('number', 0)),
-                    str(entry.get('letter', "")),
-                    float(entry.get('angle', 0.0)),
-                    float(entry.get('length', 0.0))
-                ))
+            for entry in data["corners"]:
+                rows.append(
+                    (
+                        float(entry.get("trackPosition", {}).get("x", 0.0)),
+                        float(entry.get("trackPosition", {}).get("y", 0.0)),
+                        int(entry.get("number", 0)),
+                        str(entry.get("letter", "")),
+                        float(entry.get("angle", 0.0)),
+                        float(entry.get("length", 0.0)),
+                    )
+                )
 
             return pd.DataFrame(
-                rows,
-                columns=['X', 'Y', 'Number', 'Letter', 'Angle', 'Distance']
+                rows, columns=["X", "Y", "Number", "Letter", "Angle", "Distance"]
             )
         except Exception as e:
             logger.error(f"Error fetching circuit data from API: {str(e)}")
@@ -463,17 +463,20 @@ class TelemetryExtractor:
                 # Process each lap with error handling
                 for lap_number in lap_numbers:
                     try:
-                        telemetry = self.telemetry_data(event, session, driver, lap_number)
+                        telemetry = self.telemetry_data(
+                            event, session, driver, lap_number
+                        )
                         if telemetry["tel"]:
                             file_path = f"{driver_dir}/{lap_number}_tel.json"
                             with open(file_path, "w") as json_file:
                                 json.dump(telemetry, json_file)
                     except Exception as e:
-                        logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
+                        logger.error(
+                            f"Error processing lap {lap_number} for {driver}: {str(e)}"
+                        )
                         continue
             except Exception as e:
                 logger.error(f"Error processing laps for {driver}: {str(e)}")
-
 
     def process_all_data(self, max_workers: int = 4) -> None:
         """
@@ -505,13 +508,11 @@ class TelemetryExtractor:
         logger.info("Telemetry extraction completed")
 
 
-
 def main():
     """Main entry point for the script."""
 
-
     # Create extractor and process data
-    extractor = TelemetryExtractor( )
+    extractor = TelemetryExtractor()
     extractor.process_all_data(max_workers=4)
 
 
