@@ -400,7 +400,7 @@ class TelemetryExtractor:
         Returns:
             Dictionary with corner data
         """
-         cache_key = f"{self.year}_{event}_{session}_circuit"
+        cache_key = f"{self.year}_{event}_{session}_circuit"
 
         if cache_key in self._circuit_info_cache:
             return self._circuit_info_cache[cache_key]
@@ -465,24 +465,25 @@ class TelemetryExtractor:
             # Process the data more efficiently
             rows = []
             for entry in data["corners"]:
-                rows.append({
-                    "X": float(entry.get("trackPosition", {}).get("x", 0.0)),
-                    "Y": float(entry.get("trackPosition", {}).get("y", 0.0)),
-                    "Number": int(entry.get("number", 0)),
-                    "Letter": str(entry.get("letter", "")),
-                    "Angle": float(entry.get("angle", 0.0)),
-                    "Distance": float(entry.get("length", 0.0)),
-                })
+                rows.append(
+                    {
+                        "X": float(entry.get("trackPosition", {}).get("x", 0.0)),
+                        "Y": float(entry.get("trackPosition", {}).get("y", 0.0)),
+                        "Number": int(entry.get("number", 0)),
+                        "Letter": str(entry.get("letter", "")),
+                        "Angle": float(entry.get("angle", 0.0)),
+                        "Distance": float(entry.get("length", 0.0)),
+                    }
+                )
 
             return pd.DataFrame(rows)
         except Exception as e:
             logger.error(f"Error fetching circuit data from API: {str(e)}")
             return None
 
-
-
-
-    def _process_driver_laps(self, event: str, session: str, driver: str, f1session) -> None:
+    def _process_driver_laps(
+        self, event: str, session: str, driver: str, f1session
+    ) -> None:
         """
         Process and save all laps for a specific driver.
 
@@ -525,7 +526,7 @@ class TelemetryExtractor:
                             driver,
                             lap_number,
                             tel_session,
-                            driver_dir
+                            driver_dir,
                         )
                     )
 
@@ -539,10 +540,14 @@ class TelemetryExtractor:
         except Exception as e:
             logger.error(f"Error processing laps for {driver}: {str(e)}")
 
-    def _process_single_lap(self, event, session, driver, lap_number, f1session, driver_dir):
+    def _process_single_lap(
+        self, event, session, driver, lap_number, f1session, driver_dir
+    ):
         """Process and save telemetry for a single lap."""
         try:
-            telemetry = self.telemetry_data(event, session, driver, lap_number, f1session)
+            telemetry = self.telemetry_data(
+                event, session, driver, lap_number, f1session
+            )
             if telemetry["tel"]:
                 file_path = f"{driver_dir}/{lap_number}_tel.json"
                 with open(file_path, "w") as json_file:
@@ -589,11 +594,7 @@ class TelemetryExtractor:
                 for driver in drivers:
                     futures.append(
                         executor.submit(
-                            self._process_driver_laps,
-                            event,
-                            session,
-                            driver,
-                            f1session
+                            self._process_driver_laps, event, session, driver, f1session
                         )
                     )
 
@@ -635,8 +636,6 @@ class TelemetryExtractor:
                     logger.error(f"Error in processing task: {str(e)}")
 
         logger.info("Telemetry extraction completed")
-
-
 
 
 def main():
