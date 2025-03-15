@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutorr, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastf1
