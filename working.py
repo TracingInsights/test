@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastf1
@@ -12,10 +12,6 @@ import requests
 
 import utils
 
-logging.getLogger("fastf1").setLevel(logging.WARNING)
-# Prevent propagation to avoid duplicate logs
-logging.getLogger("fastf1").propagate = False
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +19,10 @@ logging.basicConfig(
     handlers=[logging.FileHandler("telemetry_extraction.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger("telemetry_extractor")
+logging.getLogger("fastf1").setLevel(logging.WARNING)
+logging.getLogger("fastf1").propagate = False
 
+# Enable caching
 fastf1.Cache.enable_cache("cache")
 
 DEFAULT_YEAR = 2025
@@ -31,9 +30,13 @@ PROTO = "https"
 HOST = "api.multiviewer.app"
 HEADERS = {"User-Agent": f"FastF1/"}
 
+# Global cache for session objects to prevent reloading
+SESSION_CACHE = {}
+CIRCUIT_INFO_CACHE = {}
+
 
 class TelemetryExtractor:
-    """Class to handle extraction of F1 telemetry data."""
+    """Optimized class to handle extraction of F1 telemetry data."""
 
     def __init__(
         self,
@@ -41,61 +44,37 @@ class TelemetryExtractor:
         events: List[str] = None,
         sessions: List[str] = None,
     ):
-        """
-        Initialize the TelemetryExtractor.
-
-        Args:
-            year: The F1 season year
-            events: List of events to process (e.g., 'Australian Grand Prix')
-            sessions: List of sessions to process (e.g., 'Qualifying', 'Race')
-        """
+        """Initialize the TelemetryExtractor."""
         self.year = year
-        self.events = events or [
-            # 'Bahrain Grand Prix',
-            # 'Saudi Arabian Grand Prix',
-            "Australian Grand Prix",
-            # 'Azerbaijan Grand Prix',
-            # 'Miami Grand Prix',
-            # "Emilia Romagna Grand Prix",
-            # 'Monaco Grand Prix',
-            # 'Spanish Grand Prix',
-            # 'Canadian Grand Prix',
-            # 'Austrian Grand Prix',
-            # 'British Grand Prix',
-            # 'Hungarian Grand Prix',
-            # 'Belgian Grand Prix',
-            # 'Dutch Grand Prix',
-            # 'Italian Grand Prix',
-            # 'Singapore Grand Prix',
-            # 'United States Grand Prix',
-            # 'Mexico City Grand Prix',
-            # 'São Paulo Grand Prix',
-            # 'Las Vegas Grand Prix',
-            # "Qatar Grand Prix",
-            # 'Abu Dhabi Grand Prix',
-            # 'Chinese Grand Prix',
-        ]
-        self.sessions = sessions or [
-            "Qualifying",
-        ]
+        self.events = events or ["Australian Grand Prix"]
+        self.sessions = sessions or ["Qualifying"]
+
+    def get_session(
+        self, event: Union[str, int], session: str, load_telemetry: bool = False
+    ) -> fastf1.core.Session:
+        """Get a cached session object to prevent reloading."""
+        cache_key = f"{self.year}-{event}-{session}"
+        if cache_key not in SESSION_CACHE:
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load(telemetry=load_telemetry, weather=False, messages=False)
+            SESSION_CACHE[cache_key] = f1session
+        return SESSION_CACHE[cache_key]
+
+    def session_drivers_list(self, event: Union[str, int], session: str) -> List[str]:
+        """Get list of driver codes for a given event and session."""
+        try:
+            f1session = self.get_session(event, session)
+            return list(f1session.laps["Driver"].unique())
+        except Exception as e:
+            logger.error(f"Error getting driver list for {event} {session}: {str(e)}")
+            return []
 
     def session_drivers(
         self, event: Union[str, int], session: str
     ) -> Dict[str, List[Dict[str, str]]]:
-        """
-        Get drivers available for a given event and session.
-
-        Args:
-            event: Event name or number
-            session: Session name
-
-        Returns:
-            Dictionary with driver information
-        """
+        """Get drivers available for a given event and session."""
         try:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=True, weather=False, messages=False)
-
+            f1session = self.get_session(event, session)
             laps = f1session.laps
             team_colors = utils.team_colors(self.year)
             laps["color"] = laps["Team"].map(team_colors)
@@ -115,47 +94,19 @@ class TelemetryExtractor:
             logger.error(f"Error getting drivers for {event} {session}: {str(e)}")
             return {"drivers": []}
 
-    def session_drivers_list(self, event: Union[str, int], session: str) -> List[str]:
-        """
-        Get list of driver codes for a given event and session.
-
-        Args:
-            event: Event name or number
-            session: Session name
-
-        Returns:
-            List of driver codes
-        """
-        try:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=True, weather=False, messages=False)
-            laps = f1session.laps
-            return list(laps["Driver"].unique())
-        except Exception as e:
-            logger.error(f"Error getting driver list for {event} {session}: {str(e)}")
-            return []
-
     def laps_data(
-        self, event: Union[str, int], session: str, driver: str
+        self, event: Union[str, int], session: str, driver: str, f1session=None
     ) -> Dict[str, List]:
-        """
-        Get lap data for a specific driver in a session.
-
-        Args:
-            event: Event name or number
-            session: Session name
-            driver: Driver code
-
-        Returns:
-            Dictionary with lap times, numbers, and compounds
-        """
+        """Get lap data for a specific driver in a session."""
         try:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=False, weather=False, messages=False)
-            laps = f1session.laps
+            if f1session is None:
+                f1session = self.get_session(event, session)
 
-            driver_laps = laps.pick_drivers(driver)
-            driver_laps["LapTime"] = driver_laps["LapTime"].dt.total_seconds()
+            laps = f1session.laps
+            driver_laps = laps.pick_drivers(driver).copy()  # Create a copy here
+            driver_laps["LapTime"] = driver_laps["LapTime"].apply(
+                lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
+            )
             driver_laps = driver_laps[driver_laps.LapTime.notnull()]
 
             return {
@@ -172,18 +123,7 @@ class TelemetryExtractor:
     def accCalc(
         self, telemetry: pd.DataFrame, Nax: int, Nay: int, Naz: int
     ) -> pd.DataFrame:
-        """
-        Calculate acceleration components from telemetry data.
-
-        Args:
-            telemetry: Telemetry DataFrame
-            Nax: Smoothing window for x-acceleration
-            Nay: Smoothing window for y-acceleration
-            Naz: Smoothing window for z-acceleration
-
-        Returns:
-            Telemetry DataFrame with added acceleration columns
-        """
+        """Calculate acceleration components from telemetry data."""
         # Convert speed from km/h to m/s
         vx = telemetry["Speed"] / 3.6
         time_float = telemetry["Time"] / np.timedelta64(1, "s")
@@ -264,31 +204,43 @@ class TelemetryExtractor:
 
         return telemetry
 
-    def telemetry_data(
-        self, event: Union[str, int], session: str, driver: str, lap_number: int
-    ) -> Dict[str, Dict[str, List]]:
-        """
-        Get detailed telemetry data for a specific lap.
+    def process_lap(
+        self,
+        event: str,
+        session: str,
+        driver: str,
+        lap_number: int,
+        driver_dir: str,
+        f1session=None,
+        driver_laps=None,
+    ) -> bool:
+        """Process a single lap for a driver."""
+        file_path = f"{driver_dir}/{lap_number}_tel.json"
 
-        Args:
-            event: Event name or number
-            session: Session name
-            driver: Driver code
-            lap_number: Lap number to extract data for
+        # Skip if file already exists
+        if os.path.exists(file_path):
+            return True
 
-        Returns:
-            Dictionary with telemetry data
-        """
         try:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=True, weather=False, messages=False)
-            laps = f1session.laps
+            if f1session is None:
+                f1session = self.get_session(event, session, load_telemetry=True)
 
-            driver_laps = laps.pick_drivers(driver)
-            driver_laps["LapTime"] = driver_laps["LapTime"].dt.total_seconds()
+            if driver_laps is None:
+                laps = f1session.laps
+                driver_laps = laps.pick_drivers(driver)
+                driver_laps["LapTime"] = driver_laps["LapTime"].apply(
+                    lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
+                )
 
             # Get the telemetry for lap_number
             selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
+
+            if selected_lap.empty:
+                logger.warning(
+                    f"No data for {driver} lap {lap_number} in {event} {session}"
+                )
+                return False
+
             telemetry = selected_lap.get_telemetry()
             acc_tel = self.accCalc(telemetry, 3, 9, 9)
             acc_tel["Time"] = acc_tel["Time"].dt.total_seconds()
@@ -302,7 +254,7 @@ class TelemetryExtractor:
             )
             acc_tel["Brake"] = acc_tel["Brake"].apply(lambda x: 1 if x == True else 0)
 
-            return {
+            telemetry_data = {
                 "tel": {
                     "time": acc_tel["Time"].tolist(),
                     "rpm": acc_tel["RPM"].tolist(),
@@ -322,26 +274,24 @@ class TelemetryExtractor:
                     "dataKey": data_key,
                 }
             }
+
+            with open(file_path, "w") as json_file:
+                json.dump(telemetry_data, json_file)
+
+            return True
         except Exception as e:
-            logger.error(
-                f"Error getting telemetry for {driver} lap {lap_number} in {event} {session}: {str(e)}"
-            )
-            return {"tel": {}}
+            logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
+            return False
 
     def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
-        """
-        Get circuit corner information.
+        """Get circuit corner information."""
+        cache_key = f"{self.year}-{event}-{session}"
 
-        Args:
-            event: Event name
-            session: Session name
+        if cache_key in CIRCUIT_INFO_CACHE:
+            return CIRCUIT_INFO_CACHE[cache_key]
 
-        Returns:
-            Dictionary with corner data
-        """
         try:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load()
+            f1session = self.get_session(event, session)
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             # Try to get corner data from fastf1 first
@@ -354,6 +304,7 @@ class TelemetryExtractor:
                     "Angle": circuit_info["Angle"].tolist(),
                     "Distance": circuit_info["Distance"].tolist(),
                 }
+                CIRCUIT_INFO_CACHE[cache_key] = corner_info
                 return corner_info
             except (AttributeError, KeyError):
                 # Fall back to API method if fastf1 method fails
@@ -366,6 +317,7 @@ class TelemetryExtractor:
                         "Angle": circuit_info["Angle"].tolist(),
                         "Distance": (circuit_info["Distance"] / 10).tolist(),
                     }
+                    CIRCUIT_INFO_CACHE[cache_key] = corner_info
                     return corner_info
 
             logger.warning(f"Could not get corner data for {event} {session}")
@@ -375,15 +327,7 @@ class TelemetryExtractor:
             return None
 
     def _get_circuit_info_from_api(self, circuit_key: int) -> Optional[pd.DataFrame]:
-        """
-        Get circuit information from the MultiViewer API.
-
-        Args:
-            circuit_key: The unique circuit key
-
-        Returns:
-            DataFrame with circuit information
-        """
+        """Get circuit information from the MultiViewer API."""
         url = f"{PROTO}://{HOST}/api/v1/circuits/{circuit_key}/{self.year}"
         try:
             response = requests.get(url, headers=HEADERS)
@@ -412,84 +356,103 @@ class TelemetryExtractor:
             logger.error(f"Error fetching circuit data from API: {str(e)}")
             return None
 
-    def process_event_session(self, event: str, session: str) -> None:
-        """
-        Process a single event and session, extracting all telemetry data.
+    def process_driver(
+        self, event: str, session: str, driver: str, base_dir: str, f1session=None
+    ) -> None:
+        """Process all laps for a single driver."""
+        driver_dir = f"{base_dir}/{driver}"
+        os.makedirs(driver_dir, exist_ok=True)
 
-        Args:
-            event: Event name
-            session: Session name
-        """
+        try:
+            if f1session is None:
+                f1session = self.get_session(event, session, load_telemetry=True)
+
+            # Save lap times
+            laptimes = self.laps_data(event, session, driver, f1session)
+            with open(f"{driver_dir}/laptimes.json", "w") as json_file:
+                json.dump(laptimes, json_file)
+
+            # Get driver laps
+            laps = f1session.laps
+            driver_laps = laps.pick_drivers(driver).copy()  # Create a copy here
+            driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
+            driver_laps["LapTime"] = driver_laps["LapTime"].apply(
+                lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
+            )
+            lap_numbers = driver_laps["LapNumber"].tolist()
+
+            # Process laps in parallel
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(
+                        self.process_lap,
+                        event,
+                        session,
+                        driver,
+                        lap_number,
+                        driver_dir,
+                        f1session,
+                        driver_laps,
+                    )
+                    for lap_number in lap_numbers
+                ]
+
+                for future in as_completed(futures):
+                    future.result()  # Just to catch any exceptions
+
+        except Exception as e:
+            logger.error(f"Error processing driver {driver}: {str(e)}")
+
+    def process_event_session(self, event: str, session: str) -> None:
+        """Process a single event and session, extracting all telemetry data."""
         logger.info(f"Processing {event} - {session}")
 
         # Create base directory for this event/session
         base_dir = f"{event}/{session}"
         os.makedirs(base_dir, exist_ok=True)
 
-        # Save drivers information
-        drivers_info = self.session_drivers(event, session)
-        with open(f"{base_dir}/drivers.json", "w") as json_file:
-            json.dump(drivers_info, json_file)
+        try:
+            # Load session data once
+            f1session = self.get_session(event, session, load_telemetry=True)
 
-        # Save circuit corner information
-        corner_info = self.get_circuit_info(event, session)
-        if corner_info:
-            with open(f"{base_dir}/corners.json", "w") as json_file:
-                json.dump(corner_info, json_file)
+            # Save drivers information
+            drivers_info = self.session_drivers(event, session)
+            with open(f"{base_dir}/drivers.json", "w") as json_file:
+                json.dump(drivers_info, json_file)
 
-        # Process each driver
-        drivers = self.session_drivers_list(event, session)
-        for driver in drivers:
-            logger.info(f"Processing driver: {driver}")
+            # Save circuit corner information
+            corner_info = self.get_circuit_info(event, session)
+            if corner_info:
+                with open(f"{base_dir}/corners.json", "w") as json_file:
+                    json.dump(corner_info, json_file)
 
-            # Create driver directory
-            driver_dir = f"{base_dir}/{driver}"
-            os.makedirs(driver_dir, exist_ok=True)
+            # Get driver list
+            drivers = self.session_drivers_list(event, session)
 
-            # Save lap times
-            laptimes = self.laps_data(event, session, driver)
-            with open(f"{driver_dir}/laptimes.json", "w") as json_file:
-                json.dump(laptimes, json_file)
+            # Process drivers in parallel
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(
+                        self.process_driver, event, session, driver, base_dir, f1session
+                    )
+                    for driver in drivers
+                ]
 
-            # Get telemetry for each lap
-            try:
-                f1session = fastf1.get_session(self.year, event, session)
-                f1session.load(telemetry=False, weather=False, messages=False)
-                laps = f1session.laps
-                driver_laps = laps.pick_drivers(driver)
-                driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
-                lap_numbers = driver_laps["LapNumber"].tolist()
+                for future in as_completed(futures):
+                    future.result()  # Just to catch any exceptions
 
-                # Process each lap with error handling
-                for lap_number in lap_numbers:
-                    try:
-                        telemetry = self.telemetry_data(
-                            event, session, driver, lap_number
-                        )
-                        if telemetry["tel"]:
-                            file_path = f"{driver_dir}/{lap_number}_tel.json"
-                            with open(file_path, "w") as json_file:
-                                json.dump(telemetry, json_file)
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing lap {lap_number} for {driver}: {str(e)}"
-                        )
-                        continue
-            except Exception as e:
-                logger.error(f"Error processing laps for {driver}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error processing {event} - {session}: {str(e)}")
 
     def process_all_data(self, max_workers: int = 4) -> None:
-        """
-        Process all configured events and sessions, with optional parallelization.
-
-        Args:
-            max_workers: Maximum number of worker threads for parallel processing
-        """
-        logger.info(f"Starting telemetry extraction for {self.year} season")
+        """Process all configured events and sessions, with parallelization."""
+        logger.info(f"Starting optimized telemetry extraction for {self.year} season")
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
 
-        # Process each event and session
+        start_time = time.time()
+
+        # Process each event and session in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for event in self.events:
@@ -499,21 +462,83 @@ class TelemetryExtractor:
                     )
 
             # Wait for all tasks to complete
-            for future in futures:
+            for future in as_completed(futures):
                 try:
                     future.result()
                 except Exception as e:
                     logger.error(f"Error in processing task: {str(e)}")
 
-        logger.info("Telemetry extraction completed")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Telemetry extraction completed in {elapsed_time:.2f} seconds")
+
+
+import gc
+import logging
+import os
+
+import psutil
+
+logger = logging.getLogger("memory_monitor")
+
+
+def check_memory_usage(threshold_percent=80):
+    """
+    Check if memory usage exceeds threshold and clear caches if needed.
+
+    Args:
+        threshold_percent: Memory usage percentage threshold
+
+    Returns:
+        True if memory was cleared, False otherwise
+    """
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+
+    logger.info(
+        f"Current memory usage: {memory_percent:.2f}% ({memory_info.rss / 1024 / 1024:.2f} MB)"
+    )
+
+    if memory_percent > threshold_percent:
+        logger.warning(
+            f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
+        )
+        # Clear the session cache
+
+        SESSION_CACHE.clear()
+        CIRCUIT_INFO_CACHE.clear()
+
+        # Force garbage collection
+        gc.collect()
+
+        # Log new memory usage
+        new_memory_percent = psutil.Process(os.getpid()).memory_percent()
+        logger.info(
+            f"New memory usage after clearing caches: {new_memory_percent:.2f}%"
+        )
+        return True
+
+    return False
+    return False
 
 
 def main():
     """Main entry point for the script."""
+    try:
+        # Import memory monitor
 
-    # Create extractor and process data
-    extractor = TelemetryExtractor()
-    extractor.process_all_data(max_workers=4)
+        # Create extractor and process data
+        extractor = TelemetryExtractor()
+
+        # Use more workers on GitHub Actions
+        is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+        max_workers = 12 if is_github_actions else 8
+
+        extractor.process_all_data(max_workers=max_workers)
+
+    except Exception as e:
+        logger.error(f"Error in main function: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
