@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastf1
@@ -78,33 +78,6 @@ class TelemetryExtractor:
         self.sessions = sessions or [
             "Qualifying",
         ]
-        # Cache for loaded sessions to avoid reloading
-        self._session_cache = {}
-        # Cache for circuit info
-        self._circuit_info_cache = {}
-
-    def _get_session(
-        self, event: Union[str, int], session: str, load_telemetry: bool = False
-    ) -> fastf1.core.Session:
-        """
-        Get a cached session or load it if not available.
-
-        Args:
-            event: Event name or number
-            session: Session name
-            load_telemetry: Whether to load telemetry data
-
-        Returns:
-            Loaded FastF1 session
-        """
-        cache_key = f"{self.year}_{event}_{session}_{load_telemetry}"
-
-        if cache_key not in self._session_cache:
-            f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=load_telemetry, weather=False, messages=False)
-            self._session_cache[cache_key] = f1session
-
-        return self._session_cache[cache_key]
 
     def session_drivers(
         self, event: Union[str, int], session: str
@@ -120,23 +93,21 @@ class TelemetryExtractor:
             Dictionary with driver information
         """
         try:
-            f1session = self._get_session(event, session)
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load(telemetry=True, weather=False, messages=False)
+
             laps = f1session.laps
             team_colors = utils.team_colors(self.year)
+            laps["color"] = laps["Team"].map(team_colors)
 
-            # Use vectorized operations
-            laps_with_color = laps.copy()
-            laps_with_color["color"] = laps_with_color["Team"].map(team_colors)
-
-            # Get unique drivers with their teams efficiently
-            driver_team_df = laps_with_color[["Driver", "Team"]].drop_duplicates()
+            unique_drivers = laps["Driver"].unique()
 
             drivers = [
                 {
-                    "driver": row["Driver"],
-                    "team": row["Team"],
+                    "driver": driver,
+                    "team": laps[laps.Driver == driver].Team.iloc[0],
                 }
-                for _, row in driver_team_df.iterrows()
+                for driver in unique_drivers
             ]
 
             return {"drivers": drivers}
@@ -156,14 +127,16 @@ class TelemetryExtractor:
             List of driver codes
         """
         try:
-            f1session = self._get_session(event, session)
-            return list(f1session.laps["Driver"].unique())
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load(telemetry=True, weather=False, messages=False)
+            laps = f1session.laps
+            return list(laps["Driver"].unique())
         except Exception as e:
             logger.error(f"Error getting driver list for {event} {session}: {str(e)}")
             return []
 
     def laps_data(
-        self, event: Union[str, int], session: str, driver: str, f1session=None
+        self, event: Union[str, int], session: str, driver: str
     ) -> Dict[str, List]:
         """
         Get lap data for a specific driver in a session.
@@ -172,35 +145,23 @@ class TelemetryExtractor:
             event: Event name or number
             session: Session name
             driver: Driver code
-            f1session: Optional pre-loaded session
 
         Returns:
             Dictionary with lap times, numbers, and compounds
         """
         try:
-            if f1session is None:
-                f1session = self._get_session(event, session)
-
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load(telemetry=False, weather=False, messages=False)
             laps = f1session.laps
-            driver_laps = laps.pick_driver(driver)
 
-            # Convert to numpy for faster processing
-            lap_times = pd.to_numeric(
-                driver_laps["LapTime"].apply(
-                    lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
-                )
-            )
-
-            # Filter out null lap times
-            valid_indices = ~pd.isna(lap_times)
-            lap_times = lap_times[valid_indices]
-            lap_numbers = driver_laps["LapNumber"][valid_indices].tolist()
-            compounds = driver_laps["Compound"][valid_indices].tolist()
+            driver_laps = laps.pick_drivers(driver)
+            driver_laps["LapTime"] = driver_laps["LapTime"].dt.total_seconds()
+            driver_laps = driver_laps[driver_laps.LapTime.notnull()]
 
             return {
-                "time": lap_times.tolist(),
-                "lap": lap_numbers,
-                "compound": compounds,
+                "time": driver_laps["LapTime"].tolist(),
+                "lap": driver_laps["LapNumber"].tolist(),
+                "compound": driver_laps["Compound"].tolist(),
             }
         except Exception as e:
             logger.error(
@@ -223,85 +184,78 @@ class TelemetryExtractor:
         Returns:
             Telemetry DataFrame with added acceleration columns
         """
-        # Convert to numpy arrays for faster operations
-        vx = telemetry["Speed"].to_numpy() / 3.6
-        time_float = telemetry["Time"].astype("timedelta64[ns]").astype(np.int64) / 1e9
+        # Convert speed from km/h to m/s
+        vx = telemetry["Speed"] / 3.6
+        time_float = telemetry["Time"] / np.timedelta64(1, "s")
         dtime = np.gradient(time_float)
         ax = np.gradient(vx) / dtime
 
-        # Vectorized operation instead of loop
-        ax_mask = ax > 25
-        if np.any(ax_mask):
-            # Create a mask of indices to fix
-            indices = np.where(ax_mask)[0]
-            # For each index, replace with previous value
-            for i in indices:
-                if i > 0:  # Ensure we don't go out of bounds
-                    ax[i] = ax[i - 1]
+        # Clean up outliers
+        for i in np.arange(1, len(ax) - 1).astype(int):
+            if ax[i] > 25:
+                ax[i] = ax[i - 1]
 
-        # Use more efficient convolution
-        ax_smooth = np.convolve(ax, np.ones(Nax) / Nax, mode="same")
+        # Smooth x-acceleration
+        ax_smooth = np.convolve(ax, np.ones((Nax,)) / Nax, mode="same")
 
-        # Extract coordinates as numpy arrays
-        x = telemetry["X"].to_numpy()
-        y = telemetry["Y"].to_numpy()
-        z = telemetry["Z"].to_numpy()
+        # Get position data
+        x = telemetry["X"]
+        y = telemetry["Y"]
+        z = telemetry["Z"]
 
         # Calculate gradients
         dx = np.gradient(x)
         dy = np.gradient(y)
         dz = np.gradient(z)
 
-        # Calculate theta with epsilon to avoid division by zero
-        eps = np.finfo(float).eps
-        theta = np.arctan2(dy, dx + eps)
-        theta[0] = theta[1]  # Fix first value
+        # Calculate theta (angle in xy-plane)
+        theta = np.arctan2(dy, (dx + np.finfo(float).eps))
+        theta[0] = theta[1]
         theta_noDiscont = np.unwrap(theta)
 
-        dist = telemetry["Distance"].to_numpy()
+        # Calculate distance and curvature
+        dist = telemetry["Distance"]
         ds = np.gradient(dist)
         dtheta = np.gradient(theta_noDiscont)
 
-        # Vectorized operation for dtheta correction
-        dtheta_mask = np.abs(dtheta) > 0.5
-        if np.any(dtheta_mask):
-            indices = np.where(dtheta_mask)[0]
-            for i in indices:
-                if i > 0:
-                    dtheta[i] = dtheta[i - 1]
+        # Clean up outliers
+        for i in np.arange(1, len(dtheta) - 1).astype(int):
+            if abs(dtheta[i]) > 0.5:
+                dtheta[i] = dtheta[i - 1]
 
-        # Calculate curvature with small constant to avoid division by zero
-        C = dtheta / (ds + 0.0001)
-
-        # Calculate lateral acceleration
+        # Calculate curvature and lateral acceleration
+        C = dtheta / (ds + 0.0001)  # To avoid division by 0
         ay = np.square(vx) * C
 
-        # Vectorized masking for ay
-        ay[np.abs(ay) > 150] = 0
-        ay_smooth = np.convolve(ay, np.ones(Nay) / Nay, mode="same")
+        # Remove extreme values
+        indexProblems = np.abs(ay) > 150
+        ay[indexProblems] = 0
+
+        # Smooth y-acceleration
+        ay_smooth = np.convolve(ay, np.ones((Nay,)) / Nay, mode="same")
 
         # Calculate z-acceleration (similar process)
-        z_theta = np.arctan2(dz, dx + eps)
+        z_theta = np.arctan2(dz, (dx + np.finfo(float).eps))
         z_theta[0] = z_theta[1]
         z_theta_noDiscont = np.unwrap(z_theta)
 
         z_dtheta = np.gradient(z_theta_noDiscont)
 
-        # Vectorized operation for z_dtheta correction
-        z_dtheta_mask = np.abs(z_dtheta) > 0.5
-        if np.any(z_dtheta_mask):
-            indices = np.where(z_dtheta_mask)[0]
-            for i in indices:
-                if i > 0:
-                    z_dtheta[i] = z_dtheta[i - 1]
+        # Clean up outliers
+        for i in np.arange(1, len(z_dtheta) - 1).astype(int):
+            if abs(z_dtheta[i]) > 0.5:
+                z_dtheta[i] = z_dtheta[i - 1]
 
         # Calculate z-curvature and vertical acceleration
         z_C = z_dtheta / (ds + 0.0001)
         az = np.square(vx) * z_C
 
-        # Vectorized masking for az
-        az[np.abs(az) > 150] = 0
-        az_smooth = np.convolve(az, np.ones(Naz) / Naz, mode="same")
+        # Remove extreme values
+        indexProblems = np.abs(az) > 150
+        az[indexProblems] = 0
+
+        # Smooth z-acceleration
+        az_smooth = np.convolve(az, np.ones((Naz,)) / Naz, mode="same")
 
         # Add acceleration columns to telemetry
         telemetry["Ax"] = ax_smooth
@@ -311,12 +265,7 @@ class TelemetryExtractor:
         return telemetry
 
     def telemetry_data(
-        self,
-        event: Union[str, int],
-        session: str,
-        driver: str,
-        lap_number: int,
-        f1session=None,
+        self, event: Union[str, int], session: str, driver: str, lap_number: int
     ) -> Dict[str, Dict[str, List]]:
         """
         Get detailed telemetry data for a specific lap.
@@ -326,42 +275,32 @@ class TelemetryExtractor:
             session: Session name
             driver: Driver code
             lap_number: Lap number to extract data for
-            f1session: Optional pre-loaded session
 
         Returns:
             Dictionary with telemetry data
         """
         try:
-            if f1session is None:
-                f1session = self._get_session(event, session, load_telemetry=True)
-
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load(telemetry=True, weather=False, messages=False)
             laps = f1session.laps
-            driver_laps = laps.pick_driver(driver)
 
-            # Convert lap times to seconds
-            driver_laps["LapTime"] = pd.to_numeric(
-                driver_laps["LapTime"].apply(
-                    lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
-                )
-            )
+            driver_laps = laps.pick_drivers(driver)
+            driver_laps["LapTime"] = driver_laps["LapTime"].dt.total_seconds()
 
             # Get the telemetry for lap_number
             selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
-
             telemetry = selected_lap.get_telemetry()
             acc_tel = self.accCalc(telemetry, 3, 9, 9)
-
-            # Convert Time to seconds efficiently
-            acc_tel["Time"] = (
-                acc_tel["Time"].astype("timedelta64[ns]").astype(np.int64) / 1e9
-            )
+            acc_tel["Time"] = acc_tel["Time"].dt.total_seconds()
 
             # Create a unique data key for this telemetry
             data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
 
-            # Convert DRS and Brake to binary values efficiently
-            acc_tel["DRS"] = np.where(np.isin(acc_tel["DRS"], [10, 12, 14]), 1, 0)
-            acc_tel["Brake"] = np.where(acc_tel["Brake"] == True, 1, 0)
+            # Convert DRS and Brake to binary values
+            acc_tel["DRS"] = acc_tel["DRS"].apply(
+                lambda x: 1 if x in [10, 12, 14] else 0
+            )
+            acc_tel["Brake"] = acc_tel["Brake"].apply(lambda x: 1 if x == True else 0)
 
             return {
                 "tel": {
@@ -400,13 +339,10 @@ class TelemetryExtractor:
         Returns:
             Dictionary with corner data
         """
-        cache_key = f"{self.year}_{event}_{session}_circuit"
-
-        if cache_key in self._circuit_info_cache:
-            return self._circuit_info_cache[cache_key]
-
         try:
-            f1session = self._get_session(event, session)
+            f1session = fastf1.get_session(self.year, event, session)
+            f1session.load()
+            circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             # Try to get corner data from fastf1 first
             try:
@@ -418,13 +354,9 @@ class TelemetryExtractor:
                     "Angle": circuit_info["Angle"].tolist(),
                     "Distance": circuit_info["Distance"].tolist(),
                 }
-                self._circuit_info_cache[cache_key] = corner_info
                 return corner_info
-            except (AttributeError, KeyError) as e:
-                logger.warning(f"Error getting circuit info from FastF1: {e}")
-
+            except (AttributeError, KeyError):
                 # Fall back to API method if fastf1 method fails
-                circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
                 circuit_info = self._get_circuit_info_from_api(circuit_key)
                 if circuit_info is not None:
                     corner_info = {
@@ -434,7 +366,6 @@ class TelemetryExtractor:
                         "Angle": circuit_info["Angle"].tolist(),
                         "Distance": (circuit_info["Distance"] / 10).tolist(),
                     }
-                    self._circuit_info_cache[cache_key] = corner_info
                     return corner_info
 
             logger.warning(f"Could not get corner data for {event} {session}")
@@ -461,100 +392,25 @@ class TelemetryExtractor:
                 return None
 
             data = response.json()
-
-            # Process the data more efficiently
             rows = []
             for entry in data["corners"]:
                 rows.append(
-                    {
-                        "X": float(entry.get("trackPosition", {}).get("x", 0.0)),
-                        "Y": float(entry.get("trackPosition", {}).get("y", 0.0)),
-                        "Number": int(entry.get("number", 0)),
-                        "Letter": str(entry.get("letter", "")),
-                        "Angle": float(entry.get("angle", 0.0)),
-                        "Distance": float(entry.get("length", 0.0)),
-                    }
+                    (
+                        float(entry.get("trackPosition", {}).get("x", 0.0)),
+                        float(entry.get("trackPosition", {}).get("y", 0.0)),
+                        int(entry.get("number", 0)),
+                        str(entry.get("letter", "")),
+                        float(entry.get("angle", 0.0)),
+                        float(entry.get("length", 0.0)),
+                    )
                 )
 
-            return pd.DataFrame(rows)
+            return pd.DataFrame(
+                rows, columns=["X", "Y", "Number", "Letter", "Angle", "Distance"]
+            )
         except Exception as e:
             logger.error(f"Error fetching circuit data from API: {str(e)}")
             return None
-
-    def _process_driver_laps(
-        self, event: str, session: str, driver: str, f1session
-    ) -> None:
-        """
-        Process and save all laps for a specific driver.
-
-        Args:
-            event: Event name
-            session: Session name
-            driver: Driver code
-            f1session: Pre-loaded session
-        """
-        logger.info(f"Processing driver: {driver} for {event} - {session}")
-
-        # Create driver directory
-        driver_dir = f"{event}/{session}/{driver}"
-        os.makedirs(driver_dir, exist_ok=True)
-
-        # Save lap times
-        laptimes = self.laps_data(event, session, driver, f1session)
-        with open(f"{driver_dir}/laptimes.json", "w") as json_file:
-            json.dump(laptimes, json_file)
-
-        # Get telemetry for each lap
-        try:
-            laps = f1session.laps
-            driver_laps = laps.pick_driver(driver)
-            driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
-            lap_numbers = driver_laps["LapNumber"].tolist()
-
-            # Load telemetry session once for all laps
-            tel_session = self._get_session(event, session, load_telemetry=True)
-
-            # Process laps in parallel for better performance
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = []
-                for lap_number in lap_numbers:
-                    futures.append(
-                        executor.submit(
-                            self._process_single_lap,
-                            event,
-                            session,
-                            driver,
-                            lap_number,
-                            tel_session,
-                            driver_dir,
-                        )
-                    )
-
-                # Wait for all tasks to complete
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Error in lap processing task: {str(e)}")
-
-        except Exception as e:
-            logger.error(f"Error processing laps for {driver}: {str(e)}")
-
-    def _process_single_lap(
-        self, event, session, driver, lap_number, f1session, driver_dir
-    ):
-        """Process and save telemetry for a single lap."""
-        try:
-            telemetry = self.telemetry_data(
-                event, session, driver, lap_number, f1session
-            )
-            if telemetry["tel"]:
-                file_path = f"{driver_dir}/{lap_number}_tel.json"
-                with open(file_path, "w") as json_file:
-                    json.dump(telemetry, json_file)
-                logger.debug(f"Saved telemetry for {driver} lap {lap_number}")
-        except Exception as e:
-            logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
 
     def process_event_session(self, event: str, session: str) -> None:
         """
@@ -566,49 +422,63 @@ class TelemetryExtractor:
         """
         logger.info(f"Processing {event} - {session}")
 
-        try:
-            # Create base directory for this event/session
-            base_dir = f"{event}/{session}"
-            os.makedirs(base_dir, exist_ok=True)
+        # Create base directory for this event/session
+        base_dir = f"{event}/{session}"
+        os.makedirs(base_dir, exist_ok=True)
 
-            # Load session once for all operations
-            f1session = self._get_session(event, session)
+        # Save drivers information
+        drivers_info = self.session_drivers(event, session)
+        with open(f"{base_dir}/drivers.json", "w") as json_file:
+            json.dump(drivers_info, json_file)
 
-            # Save drivers information
-            drivers_info = self.session_drivers(event, session)
-            with open(f"{base_dir}/drivers.json", "w") as json_file:
-                json.dump(drivers_info, json_file)
+        # Save circuit corner information
+        corner_info = self.get_circuit_info(event, session)
+        if corner_info:
+            with open(f"{base_dir}/corners.json", "w") as json_file:
+                json.dump(corner_info, json_file)
 
-            # Save circuit corner information
-            corner_info = self.get_circuit_info(event, session)
-            if corner_info:
-                with open(f"{base_dir}/corners.json", "w") as json_file:
-                    json.dump(corner_info, json_file)
+        # Process each driver
+        drivers = self.session_drivers_list(event, session)
+        for driver in drivers:
+            logger.info(f"Processing driver: {driver}")
 
-            # Get driver list
-            drivers = self.session_drivers_list(event, session)
+            # Create driver directory
+            driver_dir = f"{base_dir}/{driver}"
+            os.makedirs(driver_dir, exist_ok=True)
 
-            # Process each driver in parallel
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = []
-                for driver in drivers:
-                    futures.append(
-                        executor.submit(
-                            self._process_driver_laps, event, session, driver, f1session
-                        )
-                    )
+            # Save lap times
+            laptimes = self.laps_data(event, session, driver)
+            with open(f"{driver_dir}/laptimes.json", "w") as json_file:
+                json.dump(laptimes, json_file)
 
-                # Wait for all tasks to complete
-                for future in as_completed(futures):
+            # Get telemetry for each lap
+            try:
+                f1session = fastf1.get_session(self.year, event, session)
+                f1session.load(telemetry=False, weather=False, messages=False)
+                laps = f1session.laps
+                driver_laps = laps.pick_drivers(driver)
+                driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
+                lap_numbers = driver_laps["LapNumber"].tolist()
+
+                # Process each lap with error handling
+                for lap_number in lap_numbers:
                     try:
-                        future.result()
+                        telemetry = self.telemetry_data(
+                            event, session, driver, lap_number
+                        )
+                        if telemetry["tel"]:
+                            file_path = f"{driver_dir}/{lap_number}_tel.json"
+                            with open(file_path, "w") as json_file:
+                                json.dump(telemetry, json_file)
                     except Exception as e:
-                        logger.error(f"Error in driver processing task: {str(e)}")
+                        logger.error(
+                            f"Error processing lap {lap_number} for {driver}: {str(e)}"
+                        )
+                        continue
+            except Exception as e:
+                logger.error(f"Error processing laps for {driver}: {str(e)}")
 
-        except Exception as e:
-            logger.error(f"Error processing {event} - {session}: {str(e)}")
-
-    def process_all_data(self, max_workers: int = 2) -> None:
+    def process_all_data(self, max_workers: int = 4) -> None:
         """
         Process all configured events and sessions, with optional parallelization.
 
@@ -619,7 +489,7 @@ class TelemetryExtractor:
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
 
-        # Process each event and session in parallel
+        # Process each event and session
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for event in self.events:
@@ -629,7 +499,7 @@ class TelemetryExtractor:
                     )
 
             # Wait for all tasks to complete
-            for future in as_completed(futures):
+            for future in futures:
                 try:
                     future.result()
                 except Exception as e:
@@ -643,7 +513,7 @@ def main():
 
     # Create extractor and process data
     extractor = TelemetryExtractor()
-    extractor.process_all_data(max_workers=2)
+    extractor.process_all_data(max_workers=4)
 
 
 if __name__ == "__main__":
