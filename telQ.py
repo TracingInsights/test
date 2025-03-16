@@ -521,46 +521,49 @@ def check_memory_usage(threshold_percent=80):
     return False
 
 
-def is_data_available(extractor, max_retries=3):
+def is_data_available(year, events, sessions):
     """
-    Check if telemetry data is available for the configured events and sessions.
+    Check if data is available for the specified year, events, and sessions.
 
     Args:
-        extractor: TelemetryExtractor instance
-        max_retries: Number of retries per event/session combination
+        year: The F1 season year
+        events: List of event names to check
+        sessions: List of session names to check
 
     Returns:
-        bool: True if data is available for at least one event/session, False otherwise
+        bool: True if data is available, False otherwise
     """
-    logger.info("Checking if telemetry data is available...")
+    try:
+        # Try to load the first event and session as a test
+        if not events or not sessions:
+            logger.warning("No events or sessions specified to check")
+            return False
 
-    for event in extractor.events:
-        for session in extractor.sessions:
-            logger.info(f"Checking data availability for {event} - {session}")
+        event = events[0]
+        session = sessions[0]
 
-            for attempt in range(max_retries):
-                try:
-                    drivers = extractor.session_drivers_list(event, session)
-                    if drivers:
-                        logger.info(
-                            f"Data available for {event} - {session} with drivers: {drivers}"
-                        )
-                        return True
-                    logger.warning(
-                        f"No drivers found for {event} - {session} (attempt {attempt+1}/{max_retries})"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Error checking data for {event} - {session} (attempt {attempt+1}/{max_retries}): {str(e)}"
-                    )
+        logger.info(f"Checking data availability for {year} {event} {session}...")
 
-                if attempt < max_retries - 1:
-                    time.sleep(
-                        2
-                    )  # Short delay between retries for the same event/session
+        # Try to get the session without loading telemetry
+        f1session = fastf1.get_session(year, event, session)
+        f1session.load(telemetry=False, weather=False, messages=False)
 
-    logger.warning("No telemetry data available for any configured event/session")
-    return False
+        # Check if we have lap data
+        if f1session.laps.empty:
+            logger.info(f"No lap data available yet for {year} {event} {session}")
+            return False
+
+        # Check if we have at least one driver
+        if len(f1session.laps["Driver"].unique()) == 0:
+            logger.info(f"No driver data available yet for {year} {event} {session}")
+            return False
+
+        logger.info(f"Data is available for {year} {event} {session}")
+        return True
+
+    except Exception as e:
+        logger.info(f"Data not yet available: {str(e)}")
+        return False
 
 
 def main():
@@ -573,38 +576,34 @@ def main():
         is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
         max_workers = 12 if is_github_actions else 8
 
-        # Configure polling parameters
-        polling_interval = 30  # Seconds between polling attempts
+        # Wait for data to be available
+        wait_time = 30  # seconds between checks
+        max_attempts = 720  # 12 hours max wait time (720 * 60 seconds)
+        attempt = 0
 
-        logger.info(
-            f"Starting telemetry extraction loop, polling every {polling_interval} seconds"
-        )
+        logger.info(f"Starting to wait for {extractor.year} season data...")
 
-        # Loop until data is available
-        attempt = 1
-        while True:
-            logger.info(f"Data availability check attempt {attempt}")
-
-            if is_data_available(extractor):
-                logger.info("Telemetry data is available, starting extraction process")
-
-                # Check memory usage before processing
-                check_memory_usage()
-
-                # Process the data
+        while attempt < max_attempts:
+            if is_data_available(extractor.year, extractor.events, extractor.sessions):
+                logger.info(
+                    f"Data is available for {extractor.year} season. Starting extraction..."
+                )
                 extractor.process_all_data(max_workers=max_workers)
-
-                logger.info("Telemetry extraction completed successfully")
                 break
             else:
-                logger.info(
-                    f"Data not available yet. Waiting {polling_interval} seconds before next attempt..."
-                )
-                time.sleep(polling_interval)
                 attempt += 1
+                logger.info(
+                    f"Data not yet available. Waiting {wait_time} seconds before retry ({attempt}/{max_attempts})..."
+                )
+                time.sleep(wait_time)
 
-        # Final memory check
-        check_memory_usage()
+                # Check memory usage and clear if needed
+                check_memory_usage()
+
+        if attempt >= max_attempts:
+            logger.error(
+                f"Exceeded maximum wait time ({max_attempts * wait_time / 3600} hours). Exiting."
+            )
 
     except Exception as e:
         logger.error(f"Error in main function: {str(e)}")
