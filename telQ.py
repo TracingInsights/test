@@ -1,14 +1,20 @@
+import functools
+import gc
 import json
 import logging
+import multiprocessing
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastf1
 import numpy as np
 import pandas as pd
+import psutil
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import utils
 
@@ -28,11 +34,22 @@ fastf1.Cache.enable_cache("cache")
 DEFAULT_YEAR = 2025
 PROTO = "https"
 HOST = "api.multiviewer.app"
+
+# Setup optimized HTTP session with connection pooling and retry logic
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10))
 HEADERS = {"User-Agent": f"FastF1/"}
 
 # Global cache for session objects to prevent reloading
 SESSION_CACHE = {}
 CIRCUIT_INFO_CACHE = {}
+TELEMETRY_CACHE = {}
+
+# Determine optimal number of workers based on CPU cores
+CPU_COUNT = multiprocessing.cpu_count()
+DEFAULT_MAX_WORKERS = min(CPU_COUNT * 2, 16)  # Use more workers but cap at reasonable limit
+DEFAULT_PROCESS_WORKERS = max(CPU_COUNT - 1, 1)  # Leave one core free for system
 
 
 class TelemetryExtractor:
@@ -50,20 +67,28 @@ class TelemetryExtractor:
         self.sessions = sessions or ["Race"]
 
     def get_session(
-        self, event: Union[str, int], session: str, load_telemetry: bool = False
+        self, event: Union[str, int], session: str, load_telemetry: bool = False, load_only: str = None
     ) -> fastf1.core.Session:
-        """Get a cached session object to prevent reloading."""
+        """Get a cached session object to prevent reloading with selective data loading."""
         cache_key = f"{self.year}-{event}-{session}"
         if cache_key not in SESSION_CACHE:
             f1session = fastf1.get_session(self.year, event, session)
-            f1session.load(telemetry=load_telemetry, weather=False, messages=False)
+
+            # Selective loading based on what's needed
+            if load_only == 'laps':
+                f1session.load(telemetry=False, weather=False, messages=False, laps=True)
+            elif load_only == 'telemetry':
+                f1session.load(telemetry=True, weather=False, messages=False, laps=False)
+            else:
+                f1session.load(telemetry=load_telemetry, weather=False, messages=False)
+
             SESSION_CACHE[cache_key] = f1session
         return SESSION_CACHE[cache_key]
 
     def session_drivers_list(self, event: Union[str, int], session: str) -> List[str]:
         """Get list of driver codes for a given event and session."""
         try:
-            f1session = self.get_session(event, session)
+            f1session = self.get_session(event, session, load_only='laps')
             return list(f1session.laps["Driver"].unique())
         except Exception as e:
             logger.error(f"Error getting driver list for {event} {session}: {str(e)}")
@@ -74,7 +99,7 @@ class TelemetryExtractor:
     ) -> Dict[str, List[Dict[str, str]]]:
         """Get drivers available for a given event and session."""
         try:
-            f1session = self.get_session(event, session)
+            f1session = self.get_session(event, session, load_only='laps')
             laps = f1session.laps
             team_colors = utils.team_colors(self.year)
             laps["color"] = laps["Team"].map(team_colors)
@@ -100,7 +125,7 @@ class TelemetryExtractor:
         """Get lap data for a specific driver in a session."""
         try:
             if f1session is None:
-                f1session = self.get_session(event, session)
+                f1session = self.get_session(event, session, load_only='laps')
 
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()  # Create a copy here
@@ -120,79 +145,87 @@ class TelemetryExtractor:
             )
             return {"time": [], "lap": [], "compound": []}
 
+    @functools.lru_cache(maxsize=128)
     def accCalc(
-        self, telemetry: pd.DataFrame, Nax: int, Nay: int, Naz: int
+        self, telemetry_key: str, Nax: int, Nay: int, Naz: int
     ) -> pd.DataFrame:
-        """Calculate acceleration components from telemetry data."""
-        # Convert speed from km/h to m/s
-        vx = telemetry["Speed"] / 3.6
-        time_float = telemetry["Time"] / np.timedelta64(1, "s")
-        dtime = np.gradient(time_float)
-        ax = np.gradient(vx) / dtime
+        """Calculate acceleration components from telemetry data - optimized with vectorization."""
+        # Retrieve telemetry from cache using the key
+        if telemetry_key not in TELEMETRY_CACHE:
+            logger.error(f"Telemetry key {telemetry_key} not found in cache")
+            return None
 
-        # Clean up outliers
-        for i in np.arange(1, len(ax) - 1).astype(int):
-            if ax[i] > 25:
-                ax[i] = ax[i - 1]
+        telemetry = TELEMETRY_CACHE[telemetry_key].copy()
+
+        # Convert to numpy arrays for faster processing
+        time_array = telemetry["Time"].to_numpy() / np.timedelta64(1, "s")
+        speed_array = telemetry["Speed"].to_numpy() / 3.6  # km/h to m/s
+        x_array = telemetry["X"].to_numpy()
+        y_array = telemetry["Y"].to_numpy()
+        z_array = telemetry["Z"].to_numpy()
+        dist_array = telemetry["Distance"].to_numpy()
+
+        # Calculate x-acceleration
+        dtime = np.gradient(time_array)
+        ax = np.gradient(speed_array) / dtime
+
+        # Clean up outliers using vectorized operations
+        ax_mask = ax > 25
+        if np.any(ax_mask):
+            ax[ax_mask] = np.roll(ax, 1)[ax_mask]
 
         # Smooth x-acceleration
         ax_smooth = np.convolve(ax, np.ones((Nax,)) / Nax, mode="same")
 
-        # Get position data
-        x = telemetry["X"]
-        y = telemetry["Y"]
-        z = telemetry["Z"]
-
         # Calculate gradients
-        dx = np.gradient(x)
-        dy = np.gradient(y)
-        dz = np.gradient(z)
+        dx = np.gradient(x_array)
+        dy = np.gradient(y_array)
+        dz = np.gradient(z_array)
 
         # Calculate theta (angle in xy-plane)
-        theta = np.arctan2(dy, (dx + np.finfo(float).eps))
-        theta[0] = theta[1]
+        theta = np.arctan2(dy, dx + np.finfo(float).eps)
+        theta[0] = theta[1]  # Fix first element
         theta_noDiscont = np.unwrap(theta)
 
         # Calculate distance and curvature
-        dist = telemetry["Distance"]
-        ds = np.gradient(dist)
+        ds = np.gradient(dist_array)
         dtheta = np.gradient(theta_noDiscont)
 
-        # Clean up outliers
-        for i in np.arange(1, len(dtheta) - 1).astype(int):
-            if abs(dtheta[i]) > 0.5:
-                dtheta[i] = dtheta[i - 1]
+        # Clean up outliers in dtheta
+        dtheta_mask = np.abs(dtheta) > 0.5
+        if np.any(dtheta_mask):
+            dtheta[dtheta_mask] = np.roll(dtheta, 1)[dtheta_mask]
 
         # Calculate curvature and lateral acceleration
         C = dtheta / (ds + 0.0001)  # To avoid division by 0
-        ay = np.square(vx) * C
+        ay = np.square(speed_array) * C
 
         # Remove extreme values
-        indexProblems = np.abs(ay) > 150
-        ay[indexProblems] = 0
+        ay_mask = np.abs(ay) > 150
+        ay[ay_mask] = 0
 
         # Smooth y-acceleration
         ay_smooth = np.convolve(ay, np.ones((Nay,)) / Nay, mode="same")
 
-        # Calculate z-acceleration (similar process)
-        z_theta = np.arctan2(dz, (dx + np.finfo(float).eps))
+        # Calculate z-acceleration
+        z_theta = np.arctan2(dz, dx + np.finfo(float).eps)
         z_theta[0] = z_theta[1]
         z_theta_noDiscont = np.unwrap(z_theta)
 
         z_dtheta = np.gradient(z_theta_noDiscont)
 
-        # Clean up outliers
-        for i in np.arange(1, len(z_dtheta) - 1).astype(int):
-            if abs(z_dtheta[i]) > 0.5:
-                z_dtheta[i] = z_dtheta[i - 1]
+        # Clean up outliers in z_dtheta
+        z_dtheta_mask = np.abs(z_dtheta) > 0.5
+        if np.any(z_dtheta_mask):
+            z_dtheta[z_dtheta_mask] = np.roll(z_dtheta, 1)[z_dtheta_mask]
 
         # Calculate z-curvature and vertical acceleration
         z_C = z_dtheta / (ds + 0.0001)
-        az = np.square(vx) * z_C
+        az = np.square(speed_array) * z_C
 
         # Remove extreme values
-        indexProblems = np.abs(az) > 150
-        az[indexProblems] = 0
+        az_mask = np.abs(az) > 150
+        az[az_mask] = 0
 
         # Smooth z-acceleration
         az_smooth = np.convolve(az, np.ones((Naz,)) / Naz, mode="same")
@@ -213,13 +246,13 @@ class TelemetryExtractor:
         driver_dir: str,
         f1session=None,
         driver_laps=None,
-    ) -> bool:
-        """Process a single lap for a driver."""
+    ) -> Dict:
+        """Process a single lap for a driver and return data for batch writing."""
         file_path = f"{driver_dir}/{lap_number}_tel.json"
 
         # Skip if file already exists
         if os.path.exists(file_path):
-            return True
+            return {"exists": True, "file_path": file_path}
 
         try:
             if f1session is None:
@@ -239,10 +272,20 @@ class TelemetryExtractor:
                 logger.warning(
                     f"No data for {driver} lap {lap_number} in {event} {session}"
                 )
-                return False
+                return None
 
             telemetry = selected_lap.get_telemetry()
-            acc_tel = self.accCalc(telemetry, 3, 9, 9)
+
+            # Create a unique key for this telemetry and store in cache
+            telemetry_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}-telemetry"
+            TELEMETRY_CACHE[telemetry_key] = telemetry
+
+            # Process telemetry with optimized accCalc
+            acc_tel = self.accCalc(telemetry_key, 3, 9, 9)
+
+            # Clean up cache after processing
+            del TELEMETRY_CACHE[telemetry_key]
+
             acc_tel["Time"] = acc_tel["Time"].dt.total_seconds()
 
             # Create a unique data key for this telemetry
@@ -275,13 +318,10 @@ class TelemetryExtractor:
                 }
             }
 
-            with open(file_path, "w") as json_file:
-                json.dump(telemetry_data, json_file)
-
-            return True
+            return {"file_path": file_path, "data": telemetry_data}
         except Exception as e:
             logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
-            return False
+            return None
 
     def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
         """Get circuit corner information."""
@@ -291,7 +331,7 @@ class TelemetryExtractor:
             return CIRCUIT_INFO_CACHE[cache_key]
 
         try:
-            f1session = self.get_session(event, session)
+            f1session = self.get_session(event, session, load_only='laps')
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             # Try to get corner data from fastf1 first
@@ -330,7 +370,8 @@ class TelemetryExtractor:
         """Get circuit information from the MultiViewer API."""
         url = f"{PROTO}://{HOST}/api/v1/circuits/{circuit_key}/{self.year}"
         try:
-            response = requests.get(url, headers=HEADERS)
+            # Use the optimized session with connection pooling
+            response = session.get(url, headers=HEADERS)
             if response.status_code != 200:
                 logger.debug(f"[{response.status_code}] {response.content.decode()}")
                 return None
@@ -359,7 +400,7 @@ class TelemetryExtractor:
     def process_driver(
         self, event: str, session: str, driver: str, base_dir: str, f1session=None
     ) -> None:
-        """Process all laps for a single driver."""
+        """Process all laps for a single driver with optimized batch file writing."""
         driver_dir = f"{base_dir}/{driver}"
         os.makedirs(driver_dir, exist_ok=True)
 
@@ -381,7 +422,8 @@ class TelemetryExtractor:
             )
             lap_numbers = driver_laps["LapNumber"].tolist()
 
-            # Process laps in parallel
+            # Process laps in parallel and collect results for batch writing
+            lap_data_results = []
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [
                     executor.submit(
@@ -398,14 +440,27 @@ class TelemetryExtractor:
                 ]
 
                 for future in as_completed(futures):
-                    future.result()  # Just to catch any exceptions
+                    result = future.result()
+                    if result and not result.get("exists", False):
+                        lap_data_results.append(result)
+
+            # Batch write files
+            for result in lap_data_results:
+                with open(result["file_path"], "w") as json_file:
+                    json.dump(result["data"], json_file)
+
+            # Clear any per-driver caches if needed
+            gc.collect()
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {str(e)}")
 
-    def process_event_session(self, event: str, session: str) -> None:
+    def process_event_session(self, event: str, session: str, max_workers: int = None) -> None:
         """Process a single event and session, extracting all telemetry data."""
         logger.info(f"Processing {event} - {session}")
+
+        if max_workers is None:
+            max_workers = DEFAULT_MAX_WORKERS
 
         # Create base directory for this event/session
         base_dir = f"{event}/{session}"
@@ -429,8 +484,8 @@ class TelemetryExtractor:
             # Get driver list
             drivers = self.session_drivers_list(event, session)
 
-            # Process drivers in parallel
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            # Process drivers in parallel with optimized worker count
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(
                         self.process_driver, event, session, driver, base_dir, f1session
@@ -441,24 +496,35 @@ class TelemetryExtractor:
                 for future in as_completed(futures):
                     future.result()  # Just to catch any exceptions
 
+            # Check memory usage after processing each session
+            check_memory_usage()
+
         except Exception as e:
             logger.error(f"Error processing {event} - {session}: {str(e)}")
 
-    def process_all_data(self, max_workers: int = 4) -> None:
-        """Process all configured events and sessions, with parallelization."""
+    def process_all_data(self, max_workers: int = None) -> None:
+        """Process all configured events and sessions, with optimized parallelization."""
         logger.info(f"Starting optimized telemetry extraction for {self.year} season")
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
 
+        if max_workers is None:
+            max_workers = DEFAULT_MAX_WORKERS
+
         start_time = time.time()
 
+        # Use a smaller number of workers for the outer loop to avoid overwhelming the system
+        outer_workers = max(2, max_workers // 2)
+
         # Process each event and session in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=outer_workers) as executor:
             futures = []
             for event in self.events:
                 for session in self.sessions:
+                    # Pass the max_workers parameter to the inner function
+                    inner_workers = max(2, max_workers // len(self.sessions))
                     futures.append(
-                        executor.submit(self.process_event_session, event, session)
+                        executor.submit(self.process_event_session, event, session, inner_workers)
                     )
 
             # Wait for all tasks to complete
@@ -467,18 +533,11 @@ class TelemetryExtractor:
                     future.result()
                 except Exception as e:
                     logger.error(f"Error in processing task: {str(e)}")
+                # Check memory usage after each task completes
+                check_memory_usage()
 
         elapsed_time = time.time() - start_time
         logger.info(f"Telemetry extraction completed in {elapsed_time:.2f} seconds")
-
-
-import gc
-import logging
-import os
-
-import psutil
-
-logger = logging.getLogger("memory_monitor")
 
 
 def check_memory_usage(threshold_percent=80):
@@ -504,9 +563,9 @@ def check_memory_usage(threshold_percent=80):
             f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
         )
         # Clear the session cache
-
         SESSION_CACHE.clear()
         CIRCUIT_INFO_CACHE.clear()
+        TELEMETRY_CACHE.clear()
 
         # Force garbage collection
         gc.collect()
@@ -572,9 +631,9 @@ def main():
         # Create extractor
         extractor = TelemetryExtractor()
 
-        # Use more workers on GitHub Actions
+        # Use more workers on GitHub Actions or based on CPU count
         is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-        max_workers = 12 if is_github_actions else 8
+        max_workers = 16 if is_github_actions else DEFAULT_MAX_WORKERS
 
         # Wait for data to be available
         wait_time = 30  # seconds between checks
@@ -611,4 +670,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Uncomment the following line to run with profiling
+    # import cProfile
+    # cProfile.run('main()', 'telQ_profile.stats')
     main()

@@ -1,3 +1,5 @@
 fastf1
 orjson
 psutil
+urllib3
+pyarrow
