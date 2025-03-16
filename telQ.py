@@ -570,7 +570,8 @@ def main():
                 logger.info(
                     f"Data is available for {extractor.year} season. Starting extraction..."
                 )
-                extractor.process_all_data(max_workers=max_workers)
+                # Remove the max_workers parameter as it's not accepted by process_all_data
+                extractor.process_all_data()
                 break
             else:
                 attempt += 1
