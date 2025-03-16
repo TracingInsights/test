@@ -574,7 +574,7 @@ def main():
         max_workers = 12 if is_github_actions else 8
 
         # Configure polling parameters
-        polling_interval = 60  # Seconds between polling attempts
+        polling_interval = 30  # Seconds between polling attempts
 
         logger.info(
             f"Starting telemetry extraction loop, polling every {polling_interval} seconds"
