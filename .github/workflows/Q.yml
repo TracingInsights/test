@@ -1,38 +1,104 @@
-name: Q
+name: F1 Telemetry Extraction
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '30 15 7 12 *'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  PYTHONUNBUFFERED: 1
 
 jobs:
-  scrape-latest:
+  extract-telemetry:
     runs-on: ubuntu-latest
 
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
       - name: Set up Python
-        uses: actions/setup-python@v2.0.0
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - name: Install requirements
-        run: pip install -r requirements.txt
-      - name: Run Telemetry
-        run: python telQ.py run-all
-      - name: Commit changes
+
+      - name: Install uv
         run: |
-          git config --local user.name github-actions
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Install dependencies with uv
+        run: |
+          uv pip install --system -r requirements.txt
+
+      - name: Configure Git for large files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global core.compression 9
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+
+      - name: Run Telemetry Extraction
+        run: python telQ.py
+        env:
+          GITHUB_ACTIONS: "true"
+
+      - name: Optimize Git before commit
+        run: |
+          git gc --aggressive --prune=now
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.name "github-actions"
           git config --local user.email "action@github.com"
-          git pull origin main
+
+          # Pull with retry mechanism
+          max_attempts=3
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Pulling from origin/main (attempt $attempt/$max_attempts)"
+            if git pull origin main --rebase; then
+              break
+            fi
+            attempt=$((attempt+1))
+            sleep 5
+          done
+
+          # Add all changes
           git add .
+
+          # Only commit if there are changes
           if [[ "$(git status --porcelain)" != "" ]]; then
-              git commit -m "Update data" -a
-              git push -u origin main
+              git commit -m "Update F1 telemetry data [skip ci]" -a
+
+              # Push with retry mechanism
+              attempt=1
+              while [ $attempt -le $max_attempts ]; do
+                echo "Pushing to origin/main (attempt $attempt/$max_attempts)"
+                if git push origin main; then
+                  break
+                fi
+                attempt=$((attempt+1))
+                sleep 5
+              done
+          else
+              echo "No changes to commit"
           fi
         env:
-          REPO_KEY: ${{secrets.GITHUB_TOKEN}}
-          username: github-actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
