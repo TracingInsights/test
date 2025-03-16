@@ -519,22 +519,92 @@ def check_memory_usage(threshold_percent=80):
         return True
 
     return False
+
+
+def is_data_available(extractor, max_retries=3):
+    """
+    Check if telemetry data is available for the configured events and sessions.
+
+    Args:
+        extractor: TelemetryExtractor instance
+        max_retries: Number of retries per event/session combination
+
+    Returns:
+        bool: True if data is available for at least one event/session, False otherwise
+    """
+    logger.info("Checking if telemetry data is available...")
+
+    for event in extractor.events:
+        for session in extractor.sessions:
+            logger.info(f"Checking data availability for {event} - {session}")
+
+            for attempt in range(max_retries):
+                try:
+                    drivers = extractor.session_drivers_list(event, session)
+                    if drivers:
+                        logger.info(
+                            f"Data available for {event} - {session} with drivers: {drivers}"
+                        )
+                        return True
+                    logger.warning(
+                        f"No drivers found for {event} - {session} (attempt {attempt+1}/{max_retries})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Error checking data for {event} - {session} (attempt {attempt+1}/{max_retries}): {str(e)}"
+                    )
+
+                if attempt < max_retries - 1:
+                    time.sleep(
+                        2
+                    )  # Short delay between retries for the same event/session
+
+    logger.warning("No telemetry data available for any configured event/session")
     return False
 
 
 def main():
     """Main entry point for the script."""
     try:
-        # Import memory monitor
-
-        # Create extractor and process data
+        # Create extractor
         extractor = TelemetryExtractor()
 
         # Use more workers on GitHub Actions
         is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
         max_workers = 12 if is_github_actions else 8
 
-        extractor.process_all_data(max_workers=max_workers)
+        # Configure polling parameters
+        polling_interval = 60  # Seconds between polling attempts
+
+        logger.info(
+            f"Starting telemetry extraction loop, polling every {polling_interval} seconds"
+        )
+
+        # Loop until data is available
+        attempt = 1
+        while True:
+            logger.info(f"Data availability check attempt {attempt}")
+
+            if is_data_available(extractor):
+                logger.info("Telemetry data is available, starting extraction process")
+
+                # Check memory usage before processing
+                check_memory_usage()
+
+                # Process the data
+                extractor.process_all_data(max_workers=max_workers)
+
+                logger.info("Telemetry extraction completed successfully")
+                break
+            else:
+                logger.info(
+                    f"Data not available yet. Waiting {polling_interval} seconds before next attempt..."
+                )
+                time.sleep(polling_interval)
+                attempt += 1
+
+        # Final memory check
+        check_memory_usage()
 
     except Exception as e:
         logger.error(f"Error in main function: {str(e)}")
