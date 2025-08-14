@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import fastf1
 import numpy as np
@@ -28,7 +28,7 @@ fastf1.Cache.enable_cache("cache")
 DEFAULT_YEAR = 2025
 PROTO = "https"
 HOST = "api.multiviewer.app"
-HEADERS = {"User-Agent": f"FastF1/"}
+HEADERS = {"User-Agent": "FastF1/"}
 
 # Global cache for session objects to prevent reloading
 SESSION_CACHE = {}
@@ -40,7 +40,7 @@ class TelemetryExtractor:
 
     def __init__(
         self,
-        year: int = DEFAULT_YEAR,
+        year: int = 2025,
         events: List[str] = None,
         sessions: List[str] = None,
     ):
@@ -238,23 +238,25 @@ class TelemetryExtractor:
     ) -> pd.DataFrame:
         """Calculate acceleration components from telemetry data."""
         # Convert speed from km/h to m/s
-        vx = telemetry["Speed"] / 3.6
-        time_float = telemetry["Time"] / np.timedelta64(1, "s")
+        vx = telemetry["Speed"].to_numpy(dtype=float) / 3.6
+        time_float = telemetry["Time"].to_numpy() / np.timedelta64(1, "s")
         dtime = np.gradient(time_float)
         ax = np.gradient(vx) / dtime
 
         # Clean up outliers
-        for i in np.arange(1, len(ax) - 1).astype(int):
-            if ax[i] > 25:
-                ax[i] = ax[i - 1]
+        # Vectorize: find all outlier positions between 1 and len-2
+        if len(ax) > 2:
+            mask_ax = np.zeros(ax.shape, dtype=bool)
+            mask_ax[1:-1] = ax[1:-1] > 25
+            self._replace_outliers_forward(ax, mask_ax)
 
         # Smooth x-acceleration
-        ax_smooth = np.convolve(ax, np.ones((Nax,)) / Nax, mode="same")
+        ax_smooth = np.convolve(ax, np.ones((Nax,), dtype=float) / Nax, mode="same")
 
         # Get position data
-        x = telemetry["X"]
-        y = telemetry["Y"]
-        z = telemetry["Z"]
+        x = telemetry["X"].to_numpy(dtype=float)
+        y = telemetry["Y"].to_numpy(dtype=float)
+        z = telemetry["Z"].to_numpy(dtype=float)
 
         # Calculate gradients
         dx = np.gradient(x)
@@ -263,54 +265,65 @@ class TelemetryExtractor:
 
         # Calculate theta (angle in xy-plane)
         theta = np.arctan2(dy, (dx + np.finfo(float).eps))
-        theta[0] = theta[1]
+        # Edge-fix as previously
+        if theta.shape[0] > 1:
+            theta[0] = theta[1]
         theta_noDiscont = np.unwrap(theta)
 
         # Calculate distance and curvature
-        dist = telemetry["Distance"]
+        dist = telemetry["Distance"].to_numpy(dtype=float)
         ds = np.gradient(dist)
         dtheta = np.gradient(theta_noDiscont)
 
-        # Clean up outliers
-        for i in np.arange(1, len(dtheta) - 1).astype(int):
-            if abs(dtheta[i]) > 0.5:
-                dtheta[i] = dtheta[i - 1]
+        # Clean up outliers in dtheta
+        if len(dtheta) > 2:
+            mask_dtheta = np.zeros(dtheta.shape, dtype=bool)
+            mask_dtheta[1:-1] = np.abs(dtheta[1:-1]) > 0.5
+            self._replace_outliers_forward(dtheta, mask_dtheta)
 
         # Calculate curvature and lateral acceleration
         C = dtheta / (ds + 0.0001)  # To avoid division by 0
         ay = np.square(vx) * C
 
-        # Remove extreme values
-        indexProblems = np.abs(ay) > 150
-        ay[indexProblems] = 0
+        # Remove extreme values (now in-place vectorized)
+        ay_mask = np.abs(ay) > 150
+        ay = (
+            ay.copy()
+        )  # Only needed if ax hasn't been already detached from previous chain
+        if np.any(ay_mask):
+            ay[ay_mask] = 0
 
         # Smooth y-acceleration
-        ay_smooth = np.convolve(ay, np.ones((Nay,)) / Nay, mode="same")
+        ay_smooth = np.convolve(ay, np.ones((Nay,), dtype=float) / Nay, mode="same")
 
         # Calculate z-acceleration (similar process)
         z_theta = np.arctan2(dz, (dx + np.finfo(float).eps))
-        z_theta[0] = z_theta[1]
+        if z_theta.shape[0] > 1:
+            z_theta[0] = z_theta[1]
         z_theta_noDiscont = np.unwrap(z_theta)
 
         z_dtheta = np.gradient(z_theta_noDiscont)
 
         # Clean up outliers
-        for i in np.arange(1, len(z_dtheta) - 1).astype(int):
-            if abs(z_dtheta[i]) > 0.5:
-                z_dtheta[i] = z_dtheta[i - 1]
+        if len(z_dtheta) > 2:
+            mask_z_dtheta = np.zeros(z_dtheta.shape, dtype=bool)
+            mask_z_dtheta[1:-1] = np.abs(z_dtheta[1:-1]) > 0.5
+            self._replace_outliers_forward(z_dtheta, mask_z_dtheta)
 
         # Calculate z-curvature and vertical acceleration
         z_C = z_dtheta / (ds + 0.0001)
         az = np.square(vx) * z_C
 
         # Remove extreme values
-        indexProblems = np.abs(az) > 150
-        az[indexProblems] = 0
+        az_mask = np.abs(az) > 150
+        az = az.copy()
+        if np.any(az_mask):
+            az[az_mask] = 0
 
         # Smooth z-acceleration
-        az_smooth = np.convolve(az, np.ones((Naz,)) / Naz, mode="same")
+        az_smooth = np.convolve(az, np.ones((Naz,), dtype=float) / Naz, mode="same")
 
-        # Add acceleration columns to telemetry
+        # Add acceleration columns to telemetry (use numpy for assignment speed)
         telemetry["Ax"] = ax_smooth
         telemetry["Ay"] = ay_smooth
         telemetry["Az"] = az_smooth
@@ -604,10 +617,17 @@ class TelemetryExtractor:
         elapsed_time = time.time() - start_time
         logger.info(f"Telemetry extraction completed in {elapsed_time:.2f} seconds")
 
+    def _replace_outliers_forward(self, arr: np.ndarray, mask: np.ndarray) -> None:
+        """In-place replace arr[i] with arr[i-1] if mask[i] is True, forward skipping."""
+        # Vectorized in-place repair using numpy
+        # Only works for isolated outliers; preserves edge behavior as original
+        indices = np.where(mask)[0]
+        for i in indices:
+            arr[i] = arr[i - 1]
+
 
 import gc
 import logging
-import os
 
 import psutil
 
