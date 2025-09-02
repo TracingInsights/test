@@ -3,60 +3,74 @@ name: FP1
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 1 14 3 *'
+    - cron: '30 11 29 8 *'
+
+
 
 env:
-  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  PYTHONUNBUFFERED: 1
 
 jobs:
-  scrape-latest:
+  extract-telemetry:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
         with:
-          sparse-checkout: |
-            telFP1.py
-            requirements.txt
-            utils.py
           fetch-depth: 1
 
-      - name: Get active event
-        id: get-event
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
         run: |
-          EVENT=$(grep -A1 "events = \[" telFP1.py | grep '"' | cut -d'"' -f2)
-          echo "EVENT=$EVENT" >> $GITHUB_ENV
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Install dependencies with uv
+        run: |
+          uv pip install --system -r requirements.txt
 
       - name: Configure Git
         run: |
-          git config --global --add safe.directory /home/runner/work/2025/2025
-          git sparse-checkout set --skip-checks telFP1.py requirements.txt utils.py "${{ env.EVENT }}/**"
-          git sparse-checkout reapply
-
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Create cache directory
-        run: mkdir -p cache
-
-      - name: Install requirements
-        run: pip install -r requirements.txt
-
-      - name: Run Telemetry
-        run: python telFP1.py run-all
-
-      - name: Commit changes
-        run: |
-          git config --local user.name github-actions
+          git config --local user.name "github-actions"
           git config --local user.email "action@github.com"
-          git stash
-          git pull origin main
-          git stash pop
-          git add --sparse -A
-          git commit -m "Update telemetry data" || echo "No changes to commit"
-          git push origin main
+          # Minimal Git configuration for performance
+          git config --global core.compression 0
+          git config --global core.preloadIndex true
+          git config --global core.fsyncMethod batch
+
+      - name: Run Telemetry Extraction
+        run: python telFP1.py
         env:
-          REPO_KEY: ${{secrets.GITHUB_TOKEN}}
-          username: github-actions
+          GITHUB_ACTIONS: "true"
+
+      - name: Commit and push changes
+        run: |
+          # Fast pull strategy
+          git pull --no-rebase --no-edit origin main || true
+
+          # Add all changes
+          git add .
+
+          # Only commit if there are changes
+          if [[ "$(git status --porcelain)" != "" ]]; then
+              git commit -m "Update F1 telemetry data [skip ci]" -a
+              git push origin main
+          else
+              echo "No changes to commit"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
