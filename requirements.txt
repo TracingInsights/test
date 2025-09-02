@@ -3,3 +3,4 @@ orjson
 psutil
 urllib3
 pyarrow
+joblib
