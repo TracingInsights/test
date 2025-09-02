@@ -461,7 +461,7 @@ class TelemetryExtractor:
         f1session=None,
         driver_laps=None,
     ) -> bool:
-        """Process a single lap for a driver."""
+        """Process a single lap for a driver."""        
         file_path = f"{driver_dir}/{lap_number}_tel.json"
 
         # Skip if file already exists
@@ -637,7 +637,7 @@ class TelemetryExtractor:
             # Get driver laps
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
-            driver_laps.loc[:, "LapNumber"] = driver_laps["LapNumber"].astype(int)
+            driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
             # Create a new column for lap times in seconds to avoid dtype conflicts
             driver_laps["LapTimeSeconds"] = driver_laps["LapTime"].apply(
                 lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
