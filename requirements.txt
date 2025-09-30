@@ -4,3 +4,4 @@ psutil
 urllib3
 pyarrow
 joblib
+msgspec
