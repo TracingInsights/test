@@ -206,7 +206,7 @@ class TelemetryExtractor:
             # 'Las Vegas Grand Prix',
             # 'Qatar Grand Prix',
             # 'Abu Dhabi Grand Prix', 
-            ]       
+            ]   
         self.sessions = sessions or ["Practice 1"]
 
     def get_session(
@@ -488,10 +488,6 @@ class TelemetryExtractor:
             if driver_laps is None:
                 laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
-                # Create a new column for lap times in seconds to avoid dtype conflicts
-                driver_laps["LapTimeSeconds"] = driver_laps["LapTime"].apply(
-                    lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
-                )
 
             selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
 
@@ -628,24 +624,15 @@ class TelemetryExtractor:
             if f1session is None:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
-            # Save lap times using msgspec
+            # Save lap times using msgspec (already returns a LapData struct)
             laptimes = self.laps_data(event, session, driver, f1session)
-            # Replace NaN values with None before JSON serialization
-            laptimes["time"] = ["None" if pd.isna(x) else x for x in laptimes["time"]]
-            laptimes["lap"] = ["None" if pd.isna(x) else x for x in laptimes["lap"]]
-            laptimes["compound"] = [
-                "None" if pd.isna(x) else x for x in laptimes["compound"]
-            ]
+            # No need to process - laps_data already handles NaN conversion
             self.write_func(laptimes, f"{driver_dir}/laptimes{self.ext}")
 
             # Get driver laps
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
             driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
-            # Create a new column for lap times in seconds to avoid dtype conflicts
-            driver_laps["LapTimeSeconds"] = driver_laps["LapTime"].apply(
-                lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
-            )
             lap_numbers = driver_laps["LapNumber"].tolist()
 
             if self.use_joblib and len(lap_numbers) > self.batch_size:
