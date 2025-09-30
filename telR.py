@@ -565,14 +565,24 @@ class TelemetryExtractor:
 
             # Save lap times using msgspec
             laptimes = self.laps_data(event, session, driver, f1session)
-            # Replace NaN values with None before JSON serialization
-            laptimes["time"] = ["None" if pd.isna(x) else x for x in laptimes["time"]]
-            laptimes["lap"] = ["None" if pd.isna(x) else x for x in laptimes["lap"]]
-            laptimes["compound"] = [
-                "None" if pd.isna(x) else x for x in laptimes["compound"]
-            ]
+            
+            # Convert laptimes struct to dict for manipulation
+            laptimes_dict = {
+                "time": ["None" if pd.isna(x) or x == "None" else x for x in laptimes.time],
+                "lap": ["None" if pd.isna(x) or x == "None" else x for x in laptimes.lap],
+                "compound": ["None" if pd.isna(x) or x == "None" else x for x in laptimes.compound],
+                "stint": laptimes.stint,
+                "s1": laptimes.s1,
+                "s2": laptimes.s2,
+                "s3": laptimes.s3,
+                "life": laptimes.life,
+                "pos": laptimes.pos,
+                "status": laptimes.status,
+                "pb": laptimes.pb,
+            }
+            
             with open(f"{driver_dir}/laptimes.json", "wb") as f:
-                f.write(encoder.encode(laptimes))
+                f.write(encoder.encode(laptimes_dict))
 
             # Get lap numbers
             laps = f1session.laps
@@ -617,74 +627,73 @@ class TelemetryExtractor:
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {str(e)}")
+        def process_event_session(self, event: str, session: str) -> None:
+            """Process event/session using msgspec for all I/O."""
+            logger.info(f"Processing {event} - {session} with msgspec optimization")
 
-    def process_event_session(self, event: str, session: str) -> None:
-        """Process event/session using msgspec for all I/O."""
-        logger.info(f"Processing {event} - {session} with msgspec optimization")
+            base_dir = f"{event}/{session}"
+            os.makedirs(base_dir, exist_ok=True)
 
-        base_dir = f"{event}/{session}"
-        os.makedirs(base_dir, exist_ok=True)
+            try:
+                f1session = self.get_session(event, session, load_telemetry=True)
 
-        try:
-            f1session = self.get_session(event, session, load_telemetry=True)
+                # Save drivers using msgspec
+                drivers_info = self.session_drivers(event, session)
+                with open(f"{base_dir}/drivers.json", "wb") as f:
+                    f.write(encoder.encode(drivers_info))
 
-            # Save drivers using msgspec
-            drivers_info = self.session_drivers(event, session)
-            with open(f"{base_dir}/drivers.json", "wb") as f:
-                f.write(encoder.encode(drivers_info))
+                # Save circuit corners using msgspec
+                corner_info = self.get_circuit_info(event, session)
+                if corner_info:
+                    with open(f"{base_dir}/corners.json", "wb") as f:
+                        f.write(encoder.encode(corner_info))
 
-            # Save circuit corners using msgspec
-            corner_info = self.get_circuit_info(event, session)
-            if corner_info:
-                with open(f"{base_dir}/corners.json", "wb") as f:
-                    f.write(encoder.encode(corner_info))
+                drivers = self.session_drivers_list(event, session)
 
-            drivers = self.session_drivers_list(event, session)
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [
+                        executor.submit(
+                            self.process_driver, event, session, driver, base_dir, f1session
+                        )
+                        for driver in drivers
+                    ]
 
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [
-                    executor.submit(
-                        self.process_driver, event, session, driver, base_dir, f1session
-                    )
-                    for driver in drivers
-                ]
+                    for future in as_completed(futures):
+                        future.result()
+
+            except Exception as e:
+                logger.error(f"Error processing {event} - {session}: {str(e)}")
+
+        def process_all_data(self, max_workers: int = 4) -> None:
+            """Process all data with msgspec optimization."""
+            logger.info(f"Starting msgspec-optimized telemetry extraction for {self.year}")
+            logger.info(f"Events: {self.events}")
+            logger.info(f"Sessions: {self.sessions}")
+
+            start_time = time.time()
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for event in self.events:
+                    for session in self.sessions:
+                        futures.append(
+                            executor.submit(self.process_event_session, event, session)
+                        )
 
                 for future in as_completed(futures):
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error in processing task: {str(e)}")
 
-        except Exception as e:
-            logger.error(f"Error processing {event} - {session}: {str(e)}")
+            elapsed_time = time.time() - start_time
+            logger.info(f"Extraction completed in {elapsed_time:.2f} seconds")
 
-    def process_all_data(self, max_workers: int = 4) -> None:
-        """Process all data with msgspec optimization."""
-        logger.info(f"Starting msgspec-optimized telemetry extraction for {self.year}")
-        logger.info(f"Events: {self.events}")
-        logger.info(f"Sessions: {self.sessions}")
-
-        start_time = time.time()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for event in self.events:
-                for session in self.sessions:
-                    futures.append(
-                        executor.submit(self.process_event_session, event, session)
-                    )
-
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Error in processing task: {str(e)}")
-
-        elapsed_time = time.time() - start_time
-        logger.info(f"Extraction completed in {elapsed_time:.2f} seconds")
-
-    def clear_joblib_cache(self):
-        """Clear joblib cache."""
-        if hasattr(memory, 'clear'):
-            memory.clear()
-            logger.info("Joblib cache cleared")
+        def clear_joblib_cache(self):
+            """Clear joblib cache."""
+            if hasattr(memory, 'clear'):
+                memory.clear()
+                logger.info("Joblib cache cleared")
 
 
 def check_memory_usage(threshold_percent=80):
