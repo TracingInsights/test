@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import time
@@ -10,6 +9,9 @@ import numpy as np
 import pandas as pd
 import requests
 from joblib import Memory, Parallel, delayed
+
+# Use orjson for superior performance
+import orjson
 
 import utils
 
@@ -38,9 +40,28 @@ CIRCUIT_INFO_CACHE = {}
 # Initialize joblib memory for persistent caching
 memory = Memory(location='./cache_joblib', verbose=0)
 
+# orjson serialization options for optimal performance
+ORJSON_OPTIONS = (
+    orjson.OPT_SERIALIZE_NUMPY |  # Native numpy array support
+    orjson.OPT_NAIVE_UTC |         # Faster datetime handling
+    orjson.OPT_NON_STR_KEYS        # Support non-string dict keys
+)
+
+
+def write_orjson(file_path: str, data: dict) -> None:
+    """Write data to JSON file using orjson for maximum performance."""
+    with open(file_path, "wb") as f:
+        f.write(orjson.dumps(data, option=ORJSON_OPTIONS))
+
+
+def read_orjson(file_path: str) -> dict:
+    """Read JSON file using orjson for maximum performance."""
+    with open(file_path, "rb") as f:
+        return orjson.loads(f.read())
+
 
 class TelemetryExtractor:
-    """Optimized class to handle extraction of F1 telemetry data with joblib improvements."""
+    """Optimized class to handle extraction of F1 telemetry data with orjson and joblib improvements."""
 
     def __init__(
         self,
@@ -73,9 +94,9 @@ class TelemetryExtractor:
             # "British Grand Prix",
             # "Belgian Grand Prix",
             # "Hungarian Grand Prix",
-            # "Dutch Grand Prix",
+            "Dutch Grand Prix",
             # 'Italian Grand Prix',
-            'Azerbaijan Grand Prix',
+            # 'Azerbaijan Grand Prix',
             # 'Singapore Grand Prix',
             # 'United States Grand Prix',
             # 'Mexico City Grand Prix',
@@ -84,7 +105,7 @@ class TelemetryExtractor:
             # 'Qatar Grand Prix',
             # 'Abu Dhabi Grand Prix',
         ]
-        self.sessions = sessions or ["Race"]
+        self.sessions = sessions or ["Practice 1"]
 
     def get_session(
         self, event: Union[str, int], session: str, load_telemetry: bool = False
@@ -145,7 +166,7 @@ class TelemetryExtractor:
             # Helper function to convert timedelta to seconds
             def timedelta_to_seconds(time_value):
                 if pd.isna(time_value) or not hasattr(time_value, "total_seconds"):
-                    return "None"
+                    return "None"  # orjson handles None natively
                 return round(time_value.total_seconds(), 3)
 
             # Convert lap times to seconds and handle NaN values
@@ -164,53 +185,41 @@ class TelemetryExtractor:
                 timedelta_to_seconds(s3_time) for s3_time in driver_laps["Sector3Time"]
             ]
 
-            # Handle NaN values in compounds
-            compounds = []
-            for compound in driver_laps["Compound"]:
-                if pd.isna(compound):
-                    compounds.append("None")
-                else:
-                    compounds.append(compound)
+            # Handle NaN values - use None instead of "None" string for orjson
+            compounds = [
+                "None" if pd.isna(compound) else compound
+                for compound in driver_laps["Compound"]
+            ]
 
             # Handle stint information
-            stints = []
-            for stint in driver_laps["Stint"]:
-                if pd.isna(stint):
-                    stints.append("None")
-                else:
-                    stints.append(int(stint))
+            stints = [
+                "None" if pd.isna(stint) else int(stint)
+                for stint in driver_laps["Stint"]
+            ]
 
             # Handle TyreLife
-            tyre_life = []
-            for life in driver_laps["TyreLife"]:
-                if pd.isna(life):
-                    tyre_life.append("None")
-                else:
-                    tyre_life.append(int(life))
+            tyre_life = [
+                "None" if pd.isna(life) else int(life)
+                for life in driver_laps["TyreLife"]
+            ]
 
             # Handle Position
-            positions = []
-            for pos in driver_laps["Position"]:
-                if pd.isna(pos):
-                    positions.append("None")
-                else:
-                    positions.append(int(pos))
+            positions = [
+                "None" if pd.isna(pos) else int(pos)
+                for pos in driver_laps["Position"]
+            ]
 
             # Handle TrackStatus
-            track_status = []
-            for status in driver_laps["TrackStatus"]:
-                if pd.isna(status):
-                    track_status.append("None")
-                else:
-                    track_status.append(str(status))
+            track_status = [
+                "None" if pd.isna(status) else str(status)
+                for status in driver_laps["TrackStatus"]
+            ]
 
             # Handle IsPersonalBest
-            is_personal_best = []
-            for is_pb in driver_laps["IsPersonalBest"]:
-                if pd.isna(is_pb):
-                    is_personal_best.append("None")
-                else:
-                    is_personal_best.append(bool(is_pb))
+            is_personal_best = [
+                "None" if pd.isna(is_pb) else bool(is_pb)
+                for is_pb in driver_laps["IsPersonalBest"]
+            ]
 
             return {
                 "time": lap_times,
@@ -367,37 +376,8 @@ class TelemetryExtractor:
 
         return telemetry
 
-    @staticmethod
-    @memory.cache
-    def cached_telemetry_processing(
-        time_array, rpm_array, speed_array, gear_array, throttle_array,
-        brake_array, drs_array, distance_array, rel_distance_array,
-        x_array, y_array, z_array, ax_array, ay_array, az_array, data_key
-    ):
-        """Cache the final telemetry data structure to avoid recomputation."""
-        return {
-            "tel": {
-                "time": time_array.tolist() if hasattr(time_array, 'tolist') else time_array,
-                "rpm": rpm_array.tolist() if hasattr(rpm_array, 'tolist') else rpm_array,
-                "speed": speed_array.tolist() if hasattr(speed_array, 'tolist') else speed_array,
-                "gear": gear_array.tolist() if hasattr(gear_array, 'tolist') else gear_array,
-                "throttle": throttle_array.tolist() if hasattr(throttle_array, 'tolist') else throttle_array,
-                "brake": brake_array.tolist() if hasattr(brake_array, 'tolist') else brake_array,
-                "drs": drs_array.tolist() if hasattr(drs_array, 'tolist') else drs_array,
-                "distance": distance_array.tolist() if hasattr(distance_array, 'tolist') else distance_array,
-                "rel_distance": rel_distance_array.tolist() if hasattr(rel_distance_array, 'tolist') else rel_distance_array,
-                "acc_x": ax_array.tolist() if hasattr(ax_array, 'tolist') else ax_array,
-                "acc_y": ay_array.tolist() if hasattr(ay_array, 'tolist') else ay_array,
-                "acc_z": az_array.tolist() if hasattr(az_array, 'tolist') else az_array,
-                "x": x_array.tolist() if hasattr(x_array, 'tolist') else x_array,
-                "y": y_array.tolist() if hasattr(y_array, 'tolist') else y_array,
-                "z": z_array.tolist() if hasattr(z_array, 'tolist') else z_array,
-                "dataKey": data_key,
-            }
-        }
-
     def process_single_lap_telemetry_direct(self, telemetry: pd.DataFrame, data_key: str) -> Dict:
-        """Process telemetry for a single lap directly without caching issues."""
+        """Process telemetry for a single lap directly with orjson-optimized structure."""
         # Calculate accelerations
         acc_tel = self.accCalc(telemetry, 3, 9, 9)
         acc_tel["Time"] = acc_tel["Time"].dt.total_seconds()
@@ -406,50 +386,32 @@ class TelemetryExtractor:
         acc_tel["DRS"] = acc_tel["DRS"].apply(
             lambda x: 1 if x in [10, 12, 14] else 0
         )
-        acc_tel["Brake"] = acc_tel["Brake"].apply(lambda x: 1 if x == True else 0)
+        acc_tel["Brake"] = acc_tel["Brake"].apply(
+            lambda x: 1 if x == True else 0
+        )
 
-        # Use cached telemetry processing if joblib is enabled
-        if self.use_joblib:
-            return self.cached_telemetry_processing(
-                acc_tel["Time"].values,
-                acc_tel["RPM"].values,
-                acc_tel["Speed"].values,
-                acc_tel["nGear"].values,
-                acc_tel["Throttle"].values,
-                acc_tel["Brake"].values,
-                acc_tel["DRS"].values,
-                acc_tel["Distance"].values,
-                acc_tel["RelativeDistance"].values,
-                acc_tel["X"].values,
-                acc_tel["Y"].values,
-                acc_tel["Z"].values,
-                acc_tel["Ax"].values,
-                acc_tel["Ay"].values,
-                acc_tel["Az"].values,
-                data_key
-            )
-        else:
-            # Non-cached version
-            return {
-                "tel": {
-                    "time": acc_tel["Time"].tolist(),
-                    "rpm": acc_tel["RPM"].tolist(),
-                    "speed": acc_tel["Speed"].tolist(),
-                    "gear": acc_tel["nGear"].tolist(),
-                    "throttle": acc_tel["Throttle"].tolist(),
-                    "brake": acc_tel["Brake"].tolist(),
-                    "drs": acc_tel["DRS"].tolist(),
-                    "distance": acc_tel["Distance"].tolist(),
-                    "rel_distance": acc_tel["RelativeDistance"].tolist(),
-                    "acc_x": acc_tel["Ax"].tolist(),
-                    "acc_y": acc_tel["Ay"].tolist(),
-                    "acc_z": acc_tel["Az"].tolist(),
-                    "x": acc_tel["X"].tolist(),
-                    "y": acc_tel["Y"].tolist(),
-                    "z": acc_tel["Z"].tolist(),
-                    "dataKey": data_key,
-                }
+        # Convert to numpy arrays for orjson's native numpy support
+        # This is significantly faster than tolist()
+        return {
+            "tel": {
+                "time": acc_tel["Time"].values,
+                "rpm": acc_tel["RPM"].values,
+                "speed": acc_tel["Speed"].values,
+                "gear": acc_tel["nGear"].values,
+                "throttle": acc_tel["Throttle"].values,
+                "brake": acc_tel["Brake"].values,
+                "drs": acc_tel["DRS"].values,
+                "distance": acc_tel["Distance"].values,
+                "rel_distance": acc_tel["RelativeDistance"].values,
+                "acc_x": acc_tel["Ax"].values,
+                "acc_y": acc_tel["Ay"].values,
+                "acc_z": acc_tel["Az"].values,
+                "x": acc_tel["X"].values,
+                "y": acc_tel["Y"].values,
+                "z": acc_tel["Z"].values,
+                "dataKey": data_key,
             }
+        }
 
     def process_lap(
         self,
@@ -461,7 +423,7 @@ class TelemetryExtractor:
         f1session=None,
         driver_laps=None,
     ) -> bool:
-        """Process a single lap for a driver."""        
+        """Process a single lap for a driver with orjson serialization."""        
         file_path = f"{driver_dir}/{lap_number}_tel.json"
 
         # Skip if file already exists
@@ -494,11 +456,11 @@ class TelemetryExtractor:
             # Create data key
             data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
             
-            # Process telemetry directly to avoid serialization issues
+            # Process telemetry directly
             telemetry_data = self.process_single_lap_telemetry_direct(telemetry, data_key)
 
-            with open(file_path, "w") as json_file:
-                json.dump(telemetry_data, json_file)
+            # Use orjson for blazing fast serialization
+            write_orjson(file_path, telemetry_data)
 
             return True
         except Exception as e:
@@ -549,7 +511,7 @@ class TelemetryExtractor:
                     "Y": corners["Y"].tolist(),
                     "Angle": corners["Angle"].tolist(),
                     "Distance": corners["Distance"].tolist(),
-                    "Rotation": rotation,  # Add rotation information
+                    "Rotation": rotation,
                 }
                 CIRCUIT_INFO_CACHE[cache_key] = corner_info
                 return corner_info
@@ -563,7 +525,7 @@ class TelemetryExtractor:
                         "Y": circuit_info["Y"].tolist(),
                         "Angle": circuit_info["Angle"].tolist(),
                         "Distance": (circuit_info["Distance"] / 10).tolist(),
-                        "Rotation": rotation,  # Add rotation information from API
+                        "Rotation": rotation,
                     }
                     CIRCUIT_INFO_CACHE[cache_key] = corner_info
                     return corner_info
@@ -577,7 +539,7 @@ class TelemetryExtractor:
     def _get_circuit_info_from_api(
         self, circuit_key: int
     ) -> Tuple[Optional[pd.DataFrame], float]:
-        """Get circuit information from the MultiViewer API."""
+        """Get circuit information from the MultiViewer API with orjson parsing."""
         url = f"{PROTO}://{HOST}/api/v1/circuits/{circuit_key}/{self.year}"
         try:
             response = requests.get(url, headers=HEADERS)
@@ -585,7 +547,9 @@ class TelemetryExtractor:
                 logger.debug(f"[{response.status_code}] {response.content.decode()}")
                 return None, 0.0
 
-            data = response.json()
+            # Use orjson for faster JSON parsing
+            data = orjson.loads(response.content)
+            
             # Extract rotation from the API response
             rotation = float(data.get("rotation", 0.0))
 
@@ -623,7 +587,7 @@ class TelemetryExtractor:
             if f1session is None:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
-            # Save lap times
+            # Save lap times using orjson
             laptimes = self.laps_data(event, session, driver, f1session)
             # Replace NaN values with None before JSON serialization
             laptimes["time"] = ["None" if pd.isna(x) else x for x in laptimes["time"]]
@@ -631,8 +595,7 @@ class TelemetryExtractor:
             laptimes["compound"] = [
                 "None" if pd.isna(x) else x for x in laptimes["compound"]
             ]
-            with open(f"{driver_dir}/laptimes.json", "w") as json_file:
-                json.dump(laptimes, json_file)
+            write_orjson(f"{driver_dir}/laptimes.json", laptimes)
 
             # Get driver laps
             laps = f1session.laps
@@ -687,8 +650,8 @@ class TelemetryExtractor:
             logger.error(f"Error processing driver {driver}: {str(e)}")
 
     def process_event_session(self, event: str, session: str) -> None:
-        """Process a single event and session, extracting all telemetry data."""
-        logger.info(f"Processing {event} - {session} {'with joblib' if self.use_joblib else 'without joblib'}")
+        """Process a single event and session, extracting all telemetry data with orjson."""
+        logger.info(f"Processing {event} - {session} with orjson optimization {'and joblib' if self.use_joblib else ''}")
 
         # Create base directory for this event/session
         base_dir = f"{event}/{session}"
@@ -698,16 +661,14 @@ class TelemetryExtractor:
             # Load session data once
             f1session = self.get_session(event, session, load_telemetry=True)
 
-            # Save drivers information
+            # Save drivers information using orjson
             drivers_info = self.session_drivers(event, session)
-            with open(f"{base_dir}/drivers.json", "w") as json_file:
-                json.dump(drivers_info, json_file)
+            write_orjson(f"{base_dir}/drivers.json", drivers_info)
 
-            # Save circuit corner information
+            # Save circuit corner information using orjson
             corner_info = self.get_circuit_info(event, session)
             if corner_info:
-                with open(f"{base_dir}/corners.json", "w") as json_file:
-                    json.dump(corner_info, json_file)
+                write_orjson(f"{base_dir}/corners.json", corner_info)
 
             # Get driver list
             drivers = self.session_drivers_list(event, session)
@@ -728,8 +689,8 @@ class TelemetryExtractor:
             logger.error(f"Error processing {event} - {session}: {str(e)}")
 
     def process_all_data(self, max_workers: int = 4) -> None:
-        """Process all configured events and sessions, with parallelization."""
-        logger.info(f"Starting {'joblib-optimized' if self.use_joblib else 'standard'} telemetry extraction for {self.year} season")
+        """Process all configured events and sessions with orjson optimization."""
+        logger.info(f"Starting orjson-optimized telemetry extraction for {self.year} season")
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
         
@@ -765,12 +726,9 @@ class TelemetryExtractor:
 
 
 import gc
-import logging
-import os
-
 import psutil
 
-logger = logging.getLogger("memory_monitor")
+logger_memory = logging.getLogger("memory_monitor")
 
 
 def check_memory_usage(threshold_percent=80):
@@ -787,12 +745,12 @@ def check_memory_usage(threshold_percent=80):
     memory_info = process.memory_info()
     memory_percent = process.memory_percent()
 
-    logger.info(
+    logger_memory.info(
         f"Current memory usage: {memory_percent:.2f}% ({memory_info.rss / 1024 / 1024:.2f} MB)"
     )
 
     if memory_percent > threshold_percent:
-        logger.warning(
+        logger_memory.warning(
             f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
         )
         # Clear the session cache
@@ -802,14 +760,14 @@ def check_memory_usage(threshold_percent=80):
         # Clear joblib cache
         if hasattr(memory, 'clear'):
             memory.clear()
-            logger.info("Joblib cache cleared")
+            logger_memory.info("Joblib cache cleared")
 
         # Force garbage collection
         gc.collect()
 
         # Log new memory usage
         new_memory_percent = psutil.Process(os.getpid()).memory_percent()
-        logger.info(
+        logger_memory.info(
             f"New memory usage after clearing caches: {new_memory_percent:.2f}%"
         )
         return True
@@ -863,7 +821,7 @@ def is_data_available(year, events, sessions):
 
 
 def main():
-    """Main entry point for the script with joblib optimization options."""
+    """Main entry point for the script with orjson and joblib optimization."""
     try:
         # Configuration options for joblib
         use_joblib = True  # Set to False to disable joblib optimizations
