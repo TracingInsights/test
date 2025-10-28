@@ -9,6 +9,7 @@ import fastf1
 import numpy as np
 import pandas as pd
 import requests
+from fastf1.ergast import Ergast
 from joblib import Memory, Parallel, delayed
 
 import utils
@@ -56,7 +57,7 @@ class TelemetryExtractor:
         self.use_joblib = use_joblib
         self.n_jobs = n_jobs  # -1 uses all available cores
         self.batch_size = batch_size  # Laps per batch for joblib processing
-        
+
         self.events = events or [
             # "Pre-Season Testing",
             # "Australian Grand Prix",
@@ -131,6 +132,46 @@ class TelemetryExtractor:
             logger.error(f"Error getting drivers for {event} {session}: {str(e)}")
             return {"drivers": []}
 
+    def _get_lap_times_from_ergast(
+        self, event: Union[str, int], session: str, driver: str, f1session=None
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetches lap times for a specific driver from the Ergast API.
+        """
+        if f1session is None:
+            f1session = self.get_session(event, session)
+
+        try:
+            # Ergast uses driverId, not the 3-letter code
+            driver_info = f1session.get_driver(driver)
+            if driver_info is None or "DriverId" not in driver_info:
+                logger.warning(f"Could not find DriverId for {driver}")
+                return None
+            driver_id = driver_info["DriverId"]
+
+            ergast = Ergast()
+            # get_lap_times returns a MultiResponse, content is a list of dataframes
+            laps_ergast_response = ergast.get_lap_times(
+                season=self.year, round=f1session.event["RoundNumber"], driver=driver_id
+            )
+
+            if not laps_ergast_response.content:
+                logger.info(f"No lap times found on Ergast for {driver} in {event} {session}")
+                return None
+
+            laps_df = laps_ergast_response.content[0]
+
+            # The time is a string like '1:23.456'. Convert to timedelta.
+            # prepend '00:' to make it a valid format for pd.to_timedelta
+            laps_df["LapTime_Ergast"] = pd.to_timedelta("00:" + laps_df["time"])
+            laps_df.rename(columns={"number": "LapNumber"}, inplace=True)
+
+            return laps_df[["LapNumber", "LapTime_Ergast"]]
+
+        except Exception as e:
+            logger.error(f"Error fetching lap times from Ergast for {driver}: {str(e)}")
+            return None
+
     def laps_data(
         self, event: Union[str, int], session: str, driver: str, f1session=None
     ) -> Dict[str, List]:
@@ -141,6 +182,17 @@ class TelemetryExtractor:
 
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
+
+            # Try to get lap times from Ergast and overwrite
+            ergast_laps = self._get_lap_times_from_ergast(event, session, driver, f1session)
+            if ergast_laps is not None and not ergast_laps.empty:
+                driver_laps['LapNumber'] = driver_laps['LapNumber'].astype(int)
+                ergast_laps['LapNumber'] = ergast_laps['LapNumber'].astype(int)
+                driver_laps = pd.merge(driver_laps, ergast_laps, on="LapNumber", how="left")
+                driver_laps["LapTime"] = driver_laps["LapTime_Ergast"].where(
+                    pd.notna(driver_laps["LapTime_Ergast"]), driver_laps["LapTime"]
+                )
+                driver_laps.drop(columns=["LapTime_Ergast"], inplace=True)
 
             # Helper function to convert timedelta to seconds
             def timedelta_to_seconds(time_value):
@@ -351,7 +403,7 @@ class TelemetryExtractor:
                     delayed(self.calculate_z_acceleration)(vx_array, x_array, z_array, dist_array, Naz)
                 ]
             )
-            
+
             ax_smooth, ay_smooth, az_smooth = results
         else:
             # Fall back to original sequential calculation for small datasets
@@ -461,7 +513,7 @@ class TelemetryExtractor:
         f1session=None,
         driver_laps=None,
     ) -> bool:
-        """Process a single lap for a driver."""        
+        """Process a single lap for a driver."""
         file_path = f"{driver_dir}/{lap_number}_tel.json"
 
         # Skip if file already exists
@@ -490,10 +542,10 @@ class TelemetryExtractor:
                 return False
 
             telemetry = selected_lap.get_telemetry()
-            
+
             # Create data key
             data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
-            
+
             # Process telemetry directly to avoid serialization issues
             telemetry_data = self.process_single_lap_telemetry_direct(telemetry, data_key)
 
@@ -506,11 +558,11 @@ class TelemetryExtractor:
             return False
 
     def process_lap_batch_with_joblib(
-        self, event: str, session: str, driver: str, lap_numbers: List[int], 
+        self, event: str, session: str, driver: str, lap_numbers: List[int],
         driver_dir: str, f1session=None
     ) -> List[bool]:
         """Process a batch of laps using joblib for CPU-intensive work."""
-        
+
         def process_single_lap_job(lap_number):
             return self.process_lap(event, session, driver, lap_number, driver_dir, f1session)
 
@@ -522,7 +574,7 @@ class TelemetryExtractor:
         else:
             # Sequential processing for small batches
             results = [process_single_lap_job(lap_num) for lap_num in lap_numbers]
-        
+
         return results
 
     def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
@@ -647,10 +699,10 @@ class TelemetryExtractor:
             if self.use_joblib and len(lap_numbers) > self.batch_size:
                 # Split laps into batches for joblib processing
                 lap_batches = [
-                    lap_numbers[i:i + self.batch_size] 
+                    lap_numbers[i:i + self.batch_size]
                     for i in range(0, len(lap_numbers), self.batch_size)
                 ]
-                
+
                 # Process batches with ThreadPoolExecutor for I/O coordination
                 with ThreadPoolExecutor(max_workers=min(4, len(lap_batches))) as executor:
                     futures = [
@@ -660,7 +712,7 @@ class TelemetryExtractor:
                         )
                         for batch in lap_batches
                     ]
-                    
+
                     for future in as_completed(futures):
                         future.result()  # Catch any exceptions
             else:
@@ -732,7 +784,7 @@ class TelemetryExtractor:
         logger.info(f"Starting {'joblib-optimized' if self.use_joblib else 'standard'} telemetry extraction for {self.year} season")
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
-        
+
         if self.use_joblib:
             logger.info(f"Joblib settings: n_jobs={self.n_jobs}, batch_size={self.batch_size}")
 
@@ -869,7 +921,7 @@ def main():
         use_joblib = True  # Set to False to disable joblib optimizations
         n_jobs = -1  # -1 uses all available cores, or specify a number
         batch_size = 8  # Number of laps per batch for joblib processing
-        
+
         # Create extractor with joblib options
         extractor = TelemetryExtractor(
             use_joblib=use_joblib,
