@@ -5,3 +5,4 @@ urllib3
 pyarrow
 joblib
 msgspec
+ratelimit

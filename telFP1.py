@@ -9,10 +9,10 @@ import fastf1
 import numpy as np
 import pandas as pd
 import requests
-from fastf1.ergast import Ergast
 from joblib import Memory, Parallel, delayed
 
 import utils
+from ergast_client import ErgastClient
 
 # Configure logging
 logging.basicConfig(
@@ -58,6 +58,7 @@ class TelemetryExtractor:
         self.use_joblib = use_joblib
         self.n_jobs = n_jobs  # -1 uses all available cores
         self.batch_size = batch_size  # Laps per batch for joblib processing
+        self.ergast_client = ErgastClient()
 
         self.events = events or [
             # "Pre-Season Testing",
@@ -137,8 +138,8 @@ class TelemetryExtractor:
         self, event: Union[str, int], session: str, driver: str, f1session=None
     ) -> Optional[pd.DataFrame]:
         """
-        Fetches lap times for a specific driver from the Ergast API.
-        This function now fetches all lap times for a race and caches them.
+        Fetches lap times for a specific driver from the Ergast API using the custom client.
+        This function fetches all lap times for a race and caches them.
         """
         if session != "Race":
             return None
@@ -153,24 +154,9 @@ class TelemetryExtractor:
             f1session = self.get_session(event, session)
 
         try:
-            ergast = Ergast()
-            all_laps_df = pd.DataFrame()
-            offset = 0
-            limit = 100
-
-            while True:
-                laps_response = ergast.get_lap_times(
-                    season=self.year, round=f1session.event["RoundNumber"], limit=limit, offset=offset
-                )
-                if not laps_response.content:
-                    break
-
-                laps_df = laps_response.content[0]
-                all_laps_df = pd.concat([all_laps_df, laps_df], ignore_index=True)
-
-                if len(laps_df) < limit:
-                    break
-                offset += limit
+            all_laps_df = self.ergast_client.get_lap_times(
+                season=self.year, round=f1session.event["RoundNumber"]
+            )
 
             if all_laps_df.empty:
                 logger.info(f"No lap times found on Ergast for {event} {session}")
@@ -180,7 +166,6 @@ class TelemetryExtractor:
             # Ensure 'time' column is string before concatenation
             all_laps_df["time"] = all_laps_df["time"].astype(str)
             all_laps_df["LapTime_Ergast"] = pd.to_timedelta("00:" + all_laps_df["time"])
-            all_laps_df.rename(columns={"number": "LapNumber"}, inplace=True)
 
             ERGAST_LAP_CACHE[cache_key] = all_laps_df
 
