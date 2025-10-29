@@ -4,12 +4,12 @@ from ratelimit import limits, sleep_and_retry
 import time
 
 # Rate limits for the Jolpica API
-# 4 requests per second
+# 2 requests per second
 ONE_SECOND = 1
-MAX_CALLS_PER_SECOND = 4
-# 500 requests per hour
+MAX_CALLS_PER_SECOND = 2
+# 200 requests per hour
 ONE_HOUR = 3600
-MAX_CALLS_PER_HOUR = 500
+MAX_CALLS_PER_HOUR = 200
 
 BASE_URL = "https://api.jolpi.ca/ergast/"
 
@@ -59,7 +59,7 @@ class ErgastClient:
         """
         all_laps_data = []
         offset = 0
-        limit = 1000  # Max limit for the API
+        limit = 100  # API caps at 100, despite docs
 
         while True:
             url = f"{BASE_URL}f1/{season}/{round}/laps.json"
@@ -87,7 +87,8 @@ class ErgastClient:
                         'time': timing.get('time')
                     })
 
-            if not laps:
+            total_results = int(mr_data.get('total', 0))
+            if offset + limit >= total_results:
                 break
 
             offset += limit
