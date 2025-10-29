@@ -47,7 +47,7 @@ class LaptimeExtractor:
         self.ergast_client = ErgastClient()
 
         self.events = events or [
-            'Mexico City Grand Prix',
+            'Australian Grand Prix',
         ]
         self.sessions = sessions or ["Race"]
 
