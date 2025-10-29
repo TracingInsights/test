@@ -1,4 +1,4 @@
-name: FP1
+name: laptimes
 
 on:
   workflow_dispatch:
