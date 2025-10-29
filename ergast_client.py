@@ -4,10 +4,10 @@ from ratelimit import limits, sleep_and_retry
 import time
 
 # Rate limits for the Jolpica API
-# 2 requests per second
+# 4 requests per second
 ONE_SECOND = 1
 MAX_CALLS_PER_SECOND = 4
-# 200 requests per hour
+# 500 requests per hour
 ONE_HOUR = 3600
 MAX_CALLS_PER_HOUR = 500
 
