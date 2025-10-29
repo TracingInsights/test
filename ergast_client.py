@@ -87,8 +87,7 @@ class ErgastClient:
                         'time': timing.get('time')
                     })
 
-            total_results = int(mr_data.get('total', 0))
-            if offset + limit >= total_results:
+            if not laps:
                 break
 
             offset += limit
